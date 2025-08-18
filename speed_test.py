@@ -29,8 +29,8 @@ def run_speed_test():
     for num_agents, timesteps, description in test_configs:
         print(f"\nTesting {description}: {num_agents} agents, {timesteps} timesteps")
         
-        # Create simulation with world size 100
-        sim = SimplifiedSimulation(world_size=100.0, num_agents=num_agents)
+        # Create simulation with world size 100 and optimized compute size for A100
+        sim = SimplifiedSimulation(world_size=100.0, num_agents=num_agents, compute_size_x=256)
         
         start_time = time.time()
         
