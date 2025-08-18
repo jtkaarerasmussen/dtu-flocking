@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+!.gitignore
+!*.py
+!*.comp
+!*.ipynb
+
+

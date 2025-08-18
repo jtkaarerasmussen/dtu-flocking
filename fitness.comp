@@ -1,0 +1,68 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y, local_size_z = 1) in;
+
+// Agent structure matching run.py Agent class
+struct Agent {
+    vec2 c;          // position
+    vec2 v;          // velocity
+    float w_g;       // gradient detection weight
+    float w_s;       // sociality weight
+    float theta;     // orientation
+    float grad_travel; // accumulated gradient travel
+};
+
+// Fitness parameters structure
+struct FitnessParams {
+    float pg;           // gradient detection cost parameter
+    float ps;           // sociality cost parameter
+    float omega_gc;     // gradient detection scaling
+    float omega_sc;     // sociality scaling
+    float eval_time;    // fitness evaluation time for normalization
+    float r_a;          // zone of avoidance radius for normalization
+};
+
+// Input/Output buffers
+layout(std430, binding = 0) restrict readonly buffer AgentsBuffer {
+    Agent agents[];
+};
+
+layout(std430, binding = 1) restrict readonly buffer FitnessParamsBuffer {
+    FitnessParams params;
+};
+
+layout(std430, binding = 2) restrict writeonly buffer FitnessBuffer {
+    float fitness_values[];
+};
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = agents.length();
+    
+    // Bounds check
+    if (agent_id >= num_agents) {
+        return;
+    }
+    
+    Agent agent = agents[agent_id];
+    
+    // Calculate fitness based on PDF section A.3
+    // Fitness formula: fi = bi - cgi - csi
+    
+    // Benefit: normalized distance traveled along positive x-axis
+    // bi = di / (speed * dt * timesteps) where di is accumulated gradient travel  
+    // Note: params.r_a is actually speed, params.eval_time is number of timesteps * dt
+    float benefit = agent.grad_travel / (params.r_a * params.eval_time);
+    
+    // Gradient detection cost: cgi = pg * (exp(ωgi/ωgc) - 1.0)
+    float gradient_cost = params.pg * (exp(agent.w_g / params.omega_gc) - 1.0);
+    
+    // Sociality cost: csi = ps * (exp(ωsi/ωsc) - 1.0)
+    float social_cost = params.ps * (exp(agent.w_s / params.omega_sc) - 1.0);
+    
+    // Total fitness: fi = bi - cgi - csi
+    float fitness = benefit - gradient_cost - social_cost;
+    
+    // Store result
+    fitness_values[agent_id] = fitness;
+}

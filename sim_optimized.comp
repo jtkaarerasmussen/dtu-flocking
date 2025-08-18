@@ -1,0 +1,214 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+struct Agent{
+    vec2 c;
+    vec2 v;
+    float w_g;
+    float w_s;
+    float theta;
+    float grad_travel;
+};
+
+// Input agents
+layout(std430, binding = 0) readonly buffer pairs_in {
+    Agent agents[];
+} In;
+
+// Simulation parameters
+layout(std430, binding = 2) readonly buffer parm_in {
+    float r_a;      // Zone of avoidance radius
+    float r_s;      // Zone of socialization radius  
+    float s;        // Speed (constant)
+    float l;        // System size
+    float t;        // Current time
+    float sigma_g;  // Gradient detection noise
+    float sigma_r;  // Random motion noise
+    float theta_max; // Maximum turning rate
+    float dt;       // Time step
+    float world_size; // World boundary size
+    float tp;       // Time period for boundary perturbation
+} Par;
+
+// Output agents
+layout(std430, binding = 5) writeonly buffer vecs_out {
+    Agent agents[];
+} Out;
+
+// OPTIMIZED: Fast wrapped distance calculation
+vec2 calc_wrapped_diff_fast(vec2 pos1, vec2 pos2) {
+    vec2 diff = pos2 - pos1;
+    
+    // Branchless periodic wrapping using fract - faster than if/else
+    diff = diff - Par.world_size * floor(diff / Par.world_size + 0.5);
+    
+    return diff;
+}
+
+// OPTIMIZED: Single hash function for all random numbers
+uint hash_fast(uint seed) {
+    seed ^= seed >> 16;
+    seed *= 0x85ebca6bu;
+    seed ^= seed >> 13;
+    seed *= 0xc2b2ae3du;
+    seed ^= seed >> 16;
+    return seed;
+}
+
+// OPTIMIZED: Fast random using single hash
+float random_fast(uint base_seed, uint offset) {
+    return float(hash_fast(base_seed + offset)) * (1.0/4294967295.0);
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = In.agents.length();
+    
+    // Early exit for out-of-bounds threads
+    if (agent_id >= num_agents) {
+        return;
+    }
+    
+    // Cache frequently accessed data in local variables
+    Agent current_agent = In.agents[agent_id];
+    vec2 agent_pos = current_agent.c;
+    Agent new_agent = current_agent;
+    
+    // OPTIMIZED: Pre-compute distance thresholds and commonly used values
+    float r_a_sq = Par.r_a * Par.r_a;
+    float r_s_sq = Par.r_s * Par.r_s;
+    float inv_dt = 1.0 / Par.dt;
+    uint time_seed = uint(Par.t * inv_dt) * 12345u + agent_id * 6789u;
+    
+    // Social interaction accumulators
+    vec2 avoidance_dir = vec2(0.0);
+    vec2 social_attract = vec2(0.0);
+    vec2 social_align = vec2(0.0);
+    bool has_avoidance = false;
+    
+    // OPTIMIZED: Single pass through neighbors with early termination
+    for (uint other_id = 0u; other_id < num_agents; other_id++) {
+        if (other_id == agent_id) continue; // Skip self
+        
+        // OPTIMIZED: Load only position first for distance check
+        vec2 other_pos = In.agents[other_id].c;
+        
+        // OPTIMIZED: Fast wrapped distance
+        vec2 diff = calc_wrapped_diff_fast(agent_pos, other_pos);
+        float dist_sq = dot(diff, diff);
+        
+        // OPTIMIZED: Early exit if too far (most common case)
+        if (dist_sq > r_s_sq) continue;
+        
+        // OPTIMIZED: Only compute sqrt when needed and cache result
+        float inv_dist = inversesqrt(dist_sq + 1e-8); // Faster than sqrt, adds small epsilon
+        float dist = dist_sq * inv_dist;
+        vec2 unit_diff = diff * inv_dist;
+        
+        // Check for avoidance (highest priority)
+        if (dist_sq <= r_a_sq) {
+            has_avoidance = true;
+            avoidance_dir -= unit_diff; // OPTIMIZED: No division needed, already normalized
+        }
+        // Social interaction
+        else {
+            social_attract += unit_diff;
+            
+            // OPTIMIZED: Load velocity only when needed
+            vec2 other_vel = In.agents[other_id].v;
+            float vel_len_sq = dot(other_vel, other_vel);
+            if (vel_len_sq > 1e-6) { // Avoid normalization of near-zero vectors
+                social_align += other_vel * inversesqrt(vel_len_sq);
+            }
+        }
+    }
+    
+    // ========== COMPUTE DESIRED DIRECTION ==========
+    vec2 desired_dir;
+    
+    if (has_avoidance) {
+        // AVOIDANCE has highest priority
+        float avoid_len_sq = dot(avoidance_dir, avoidance_dir);
+        desired_dir = (avoid_len_sq > 1e-6) ? avoidance_dir * inversesqrt(avoid_len_sq) : vec2(1.0, 0.0);
+    } else {
+        // Combine social and gradient forces
+        vec2 social_dir = social_attract + social_align;
+        
+        // OPTIMIZED: Gradient direction computation
+        vec2 gradient_dir = vec2(0.0);
+        float w_g = new_agent.w_g;
+        
+        if (w_g > 0.001) {
+            // OPTIMIZED: Pre-compute expensive operations
+            float neg_wg_dt = -w_g * Par.dt;
+            float decay = exp(neg_wg_dt);
+            float noise_var = Par.sigma_g * Par.sigma_g * (1.0 - exp(2.0 * neg_wg_dt)) / (2.0 * w_g);
+            float noise_scale = sqrt(noise_var);
+            
+            // OPTIMIZED: Fast Box-Muller using pre-computed seeds
+            float u1 = max(random_fast(time_seed, 73u), 1e-8);
+            float u2 = random_fast(time_seed, 97u);
+            float zeta = sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2); // 2*pi precomputed
+            
+            // Update theta
+            float theta = current_agent.theta * decay + noise_scale * zeta;
+            // OPTIMIZED: Fast angle wrapping using fract
+            theta = theta - 6.28318530718 * floor(theta * 0.15915494309 + 0.5); // 1/(2*pi) precomputed
+            
+            new_agent.theta = theta;
+            gradient_dir = vec2(cos(theta), sin(theta));
+        } else {
+            new_agent.theta = current_agent.theta;
+        }
+        
+        // OPTIMIZED: Random direction with pre-computed seeds  
+        float rand_x = random_fast(time_seed, 37u) - 0.5;
+        float rand_y = random_fast(time_seed, 41u) - 0.5;
+        vec2 random_dir = vec2(rand_x, rand_y);
+        
+        // Combine forces
+        desired_dir = w_g * gradient_dir + new_agent.w_s * social_dir + Par.sigma_r * random_dir;
+    }
+    
+    // OPTIMIZED: Normalize desired direction  
+    float desired_len_sq = dot(desired_dir, desired_dir);
+    if (desired_len_sq > 1e-6) {
+        desired_dir *= inversesqrt(desired_len_sq);
+    } else {
+        desired_dir = vec2(1.0, 0.0);
+    }
+    
+    // ========== APPLY MOVEMENT CONSTRAINTS ==========
+    vec2 current_vel_dir;
+    float current_vel_len_sq = dot(current_agent.v, current_agent.v);
+    if (current_vel_len_sq > 1e-6) {
+        current_vel_dir = current_agent.v * inversesqrt(current_vel_len_sq);
+    } else {
+        current_vel_dir = vec2(1.0, 0.0);
+    }
+    
+    // OPTIMIZED: Turning rate limit using mix
+    float turn_rate = Par.theta_max * Par.dt;
+    vec2 new_dir = mix(current_vel_dir, desired_dir, turn_rate);
+    
+    // OPTIMIZED: Normalize and set velocity
+    float new_dir_len_sq = dot(new_dir, new_dir);
+    if (new_dir_len_sq > 1e-6) {
+        new_agent.v = new_dir * (Par.s * inversesqrt(new_dir_len_sq));
+    } else {
+        new_agent.v = vec2(Par.s, 0.0);
+    }
+    
+    // OPTIMIZED: Position update
+    new_agent.c = current_agent.c + new_agent.v * Par.dt;
+    
+    // OPTIMIZED: Gradient travel update
+    new_agent.grad_travel = current_agent.grad_travel + new_agent.v.x * Par.dt;
+    
+    // OPTIMIZED: Fast periodic boundary conditions using fract
+    new_agent.c = new_agent.c - Par.world_size * floor(new_agent.c / Par.world_size);
+    
+    // Write result
+    Out.agents[agent_id] = new_agent;
+}
