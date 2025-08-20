@@ -39,7 +39,14 @@ if __name__ == "__main__":
     # Print top CPU consumers
     stats = pstats.Stats('cpu_profile.prof')
     stats.sort_stats('cumulative')
-    stats.print_stats(20)  # Top 20 functions
+    print("=== TOP 20 CPU CONSUMERS (by cumulative time) ===")
+    stats.print_stats(20)
+    
+    print("\n=== GPU/BUFFER/MODERNGL RELATED FUNCTIONS ===")
+    stats.print_stats('.*gpu.*|.*buffer.*|.*moderngl.*|.*gl.*')
+    
+    print("\n=== TIMESTEP/SIMULATION RELATED FUNCTIONS ===")
+    stats.print_stats('.*timestep.*|.*simulation.*|.*fitness.*')
     
     print("\nProfile saved to cpu_profile.prof")
-    print("View with: python -m pstats cpu_profile.prof")
+    print("Run this script on the A100 system to see the actual bottleneck")
