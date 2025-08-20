@@ -28,7 +28,7 @@ class SimplifiedSimulation:
     def __init__(self, world_size: float, num_agents: int, 
                  r_a: float = 0.05, r_s: float = 0.3, s: float = 0.1, 
                  sigma_g: float = 0.1, sigma_r: float = 0.1, theta_max: float = 2.0, 
-                 dt: float = 0.01, tp: float = 100.0, compute_size_x: int = 32):
+                 dt: float = 0.01, tp: float = 100.0, compute_size_x: int = 256):
         """
         Simplified simulation without grid system
         
