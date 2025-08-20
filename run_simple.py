@@ -78,7 +78,11 @@ class SimplifiedSimulation:
         # Load fitness shader
         self._load_fitness_shader()
         
-        # Initialize agents and buffers
+        # Load grid-based shaders for O(N) complexity
+        self._load_grid_shaders()
+        self._setup_grid_system()
+        
+        # Initialize agents and buffers (after grid setup)
         self.agents = self._generate_random_agents(num_agents)
         self._setup_buffers()
         
@@ -115,6 +119,53 @@ class SimplifiedSimulation:
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
         
         self.fitness_shader = self.ctx.compute_shader(shader_source)
+    
+    def _load_grid_shaders(self):
+        """Load and compile grid-based compute shaders for O(N) complexity"""
+        # Grid construction shader
+        with open('grid_construct.comp', 'r') as f:
+            shader_source = f.read()
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        self.grid_construct_shader = self.ctx.compute_shader(shader_source)
+        
+        # Grid finalization shader  
+        with open('grid_finalize.comp', 'r') as f:
+            shader_source = f.read()
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        self.grid_finalize_shader = self.ctx.compute_shader(shader_source)
+        
+        # Main grid-based simulation shader
+        with open('sim_simple_grid.comp', 'r') as f:
+            shader_source = f.read()
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        self.grid_sim_shader = self.ctx.compute_shader(shader_source)
+    
+    def _setup_grid_system(self):
+        """Setup grid system for spatial partitioning"""
+        # Calculate optimal grid size based on interaction radius
+        # Grid cell size should be slightly larger than r_s for efficiency
+        r_s = self.sim_params['r_s']
+        self.grid_cell_size = max(r_s * 1.2, self.world_size / 64)  # Minimum 64x64 grid
+        self.grid_size = max(8, int(np.ceil(self.world_size / self.grid_cell_size)))
+        self.total_grid_cells = self.grid_size * self.grid_size
+        
+        print(f"Grid system: {self.grid_size}x{self.grid_size} cells, cell_size={self.grid_cell_size:.4f}")
+        
+        # Create grid-related buffers
+        # Grid cells buffer (start_index, count, padding, padding)
+        grid_data = np.zeros(self.total_grid_cells * 4, dtype=np.uint32)
+        self.grid_buffer = self.ctx.buffer(grid_data.tobytes())
+        
+        # Agent-grid key pairs for sorting
+        agent_keys_data = np.zeros(self.num_agents * 4, dtype=np.uint32)  # agent_index, grid_key, pad, pad
+        self.agent_keys_buffer = self.ctx.buffer(agent_keys_data.tobytes())
+        
+        # Sorted agent indices
+        sorted_indices_data = np.zeros(self.num_agents, dtype=np.uint32)
+        self.sorted_indices_buffer = self.ctx.buffer(sorted_indices_data.tobytes())
     
     def _generate_random_agents(self, num_agents: int) -> List[Agent]:
         """Generate random agents within world bounds"""
@@ -158,7 +209,7 @@ class SimplifiedSimulation:
     def _update_params_buffer(self):
         """Update parameters buffer with current simulation time"""
         self.sim_params['t'] = self.current_time
-        param_data = struct.pack('fffffffffff', 
+        param_data = struct.pack('fffffffffffIf', 
                                 self.sim_params['r_a'],
                                 self.sim_params['r_s'],
                                 self.sim_params['s'],
@@ -169,7 +220,9 @@ class SimplifiedSimulation:
                                 self.sim_params['theta_max'],
                                 self.sim_params['dt'],
                                 self.sim_params['world_size'],
-                                self.sim_params['tp'])
+                                self.sim_params['tp'],
+                                self.grid_size,  # uint (I format)
+                                self.grid_cell_size)  # float
         
         if hasattr(self, 'params_buffer'):
             self.params_buffer.write(param_data)
@@ -232,6 +285,71 @@ class SimplifiedSimulation:
         
         # Update time and swap buffers
         self.current_time += batch_size * self.dt
+        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
+
+    def timestep_gpu_grid(self, sync_gpu: bool = False):
+        """
+        GPU timestep with O(N) grid-based spatial partitioning
+        Much faster for large numbers of agents compared to O(N²) approach
+        
+        Args:
+            sync_gpu: If True, wait for GPU to complete (for accurate timing)
+        """
+        # Update time parameter
+        self._update_params_buffer()
+        
+        # Step 1: Build spatial grid (assign agents to grid cells)
+        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
+        self.params_buffer.bind_to_storage_buffer(2)         # Parameters  
+        self.agent_keys_buffer.bind_to_storage_buffer(6)     # Output: agent keys
+        self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells (for initialization)
+        
+        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
+        self.grid_construct_shader.run(num_work_groups, 1, 1)
+        
+        self.ctx.memory_barrier()
+        
+        # Step 2: Sort agents by grid key (CPU-based sorting for simplicity)
+        # Read agent keys from GPU
+        agent_keys_data = np.frombuffer(self.agent_keys_buffer.read(), dtype=np.uint32)
+        agent_keys = agent_keys_data.reshape(-1, 4)[:, :2]  # Only need agent_index and grid_key
+        
+        # Sort by grid key
+        sort_indices = np.argsort(agent_keys[:, 1])  # Sort by grid_key (column 1)
+        sorted_agent_keys = agent_keys[sort_indices]
+        
+        # Write sorted data back to GPU
+        sorted_data = np.zeros((self.num_agents, 4), dtype=np.uint32)
+        sorted_data[:, :2] = sorted_agent_keys
+        self.agent_keys_buffer.write(sorted_data.tobytes())
+        
+        # Step 3: Build final grid structure
+        self.agent_keys_buffer.bind_to_storage_buffer(6)     # Sorted agent keys
+        self.grid_buffer.bind_to_storage_buffer(1)           # Output: Grid cells
+        self.sorted_indices_buffer.bind_to_storage_buffer(3) # Output: Sorted indices
+        
+        max_work_groups = max(num_work_groups, (self.total_grid_cells + self.compute_size_x - 1) // self.compute_size_x)
+        self.grid_finalize_shader.run(max_work_groups, 1, 1)
+        
+        self.ctx.memory_barrier()
+        
+        # Step 4: Run main simulation with grid-based neighbor finding
+        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
+        self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells
+        self.params_buffer.bind_to_storage_buffer(2)         # Parameters
+        self.sorted_indices_buffer.bind_to_storage_buffer(3) # Sorted agent indices  
+        self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
+        
+        self.grid_sim_shader.run(num_work_groups, 1, 1)
+        
+        # Force GPU synchronization
+        if sync_gpu:
+            self.ctx.finish()
+        
+        self.ctx.memory_barrier()
+        
+        # Update time and swap buffers
+        self.current_time += self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
 
     def timestep(self):

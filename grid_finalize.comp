@@ -1,0 +1,92 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+// Grid cell structure
+struct GridCell {
+    uint start_index;
+    uint count;
+    uint padding[2];
+};
+
+// Agent with grid key (sorted)
+struct AgentGridKey {
+    uint agent_index;
+    uint grid_key;
+    uint padding[2];
+};
+
+// Parameters
+layout(std430, binding = 2) readonly buffer parm_in {
+    float r_a;
+    float r_s;
+    float s;
+    float l;
+    float t;
+    float sigma_g;
+    float sigma_r;
+    float theta_max;
+    float dt;
+    float world_size;
+    float tp;
+    uint grid_size;
+    float cell_size;
+} Par;
+
+// Input: Sorted agent keys
+layout(std430, binding = 6) readonly buffer agent_keys_in {
+    AgentGridKey agent_keys[];
+} AgentKeys;
+
+// Output: Final grid structure
+layout(std430, binding = 1) writeonly buffer grid_out {
+    GridCell grid[];
+} GridOut;
+
+// Output: Sorted agent indices for easy access
+layout(std430, binding = 3) writeonly buffer sorted_indices_out {
+    uint sorted_indices[];
+} SortedIndices;
+
+void main() {
+    uint thread_id = gl_GlobalInvocationID.x;
+    uint num_agents = AgentKeys.agent_keys.length();
+    uint total_cells = Par.grid_size * Par.grid_size;
+    
+    // Initialize grid cells (first pass)
+    if (thread_id < total_cells) {
+        GridOut.grid[thread_id].start_index = 0;
+        GridOut.grid[thread_id].count = 0;
+    }
+    
+    // Sync to ensure all cells are initialized
+    barrier();
+    
+    // Process agent keys to build grid (second pass)
+    if (thread_id < num_agents) {
+        // Copy sorted agent index
+        SortedIndices.sorted_indices[thread_id] = AgentKeys.agent_keys[thread_id].agent_index;
+        
+        uint current_key = AgentKeys.agent_keys[thread_id].grid_key;
+        
+        // Check if this is the start of a new cell (no race condition here)
+        bool is_first_in_cell = (thread_id == 0) || (AgentKeys.agent_keys[thread_id - 1].grid_key != current_key);
+        
+        if (is_first_in_cell && current_key < total_cells) {
+            // This thread is responsible for setting up this grid cell
+            GridOut.grid[current_key].start_index = thread_id;
+            
+            // Count consecutive agents with the same grid key
+            uint count = 1;
+            for (uint i = thread_id + 1; i < num_agents; i++) {
+                if (AgentKeys.agent_keys[i].grid_key == current_key) {
+                    count++;
+                } else {
+                    break;
+                }
+            }
+            
+            GridOut.grid[current_key].count = count;
+        }
+    }
+}

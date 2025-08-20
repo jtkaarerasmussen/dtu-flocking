@@ -188,25 +188,16 @@ class CheckpointEvolutionSimulation:
         for run in range(self.nr):
             self._reset_simulation_state(sim, population)
             
-            # Run transient period using batched timesteps
-            batch_size = 10
-            full_batches = self.tau_tr // batch_size
-            for _ in range(full_batches):
-                sim.timestep_gpu_batched(batch_size=batch_size)
-            remaining = self.tau_tr % batch_size
-            if remaining > 0:
-                sim.timestep_gpu_batched(batch_size=remaining)
+            # Run transient period using grid-based timesteps
+            for _ in range(self.tau_tr):
+                sim.timestep_gpu_grid()
             
             # Reset gradient travel for fitness evaluation
             self._reset_gradient_travel(sim)
             
-            # Run fitness evaluation period using batched timesteps
-            full_batches = self.tau_fit // batch_size
-            for _ in range(full_batches):
-                sim.timestep_gpu_batched(batch_size=batch_size)
-            remaining = self.tau_fit % batch_size
-            if remaining > 0:
-                sim.timestep_gpu_batched(batch_size=remaining)
+            # Run fitness evaluation period using grid-based timesteps
+            for _ in range(self.tau_fit):
+                sim.timestep_gpu_grid()
             
             # Calculate fitness on GPU
             run_fitness = sim.calculate_fitness_gpu(
@@ -468,18 +459,18 @@ def create_default_params_file(filename="evolution_params.json"):
     """Create a default parameters JSON file"""
     default_params = {
         "world_size": 2.0,
-        "num_agents": 640,
+        "num_agents": 320,
         "density": 0.0277,
         "pg": 1.0,
         "ps": 0.0,
         "omega_gc": 4.0,
         "omega_sc": 4.0,
         "sigma_mu": 0.01,
-        "tau_tr": 50,
-        "tau_fit": 25,
-        "nr": 2,
+        "tau_tr": 2000,
+        "tau_fit": 500,
+        "nr": 30,
         "checkpoint_interval": 10,
-        "num_generations": 100
+        "num_generations": 300
     }
     
     with open(filename, 'w') as f:
