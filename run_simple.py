@@ -78,6 +78,9 @@ class SimplifiedSimulation:
         # Load fitness shader
         self._load_fitness_shader()
         
+        # Load gradient reset shader
+        self._load_gradient_reset_shader()
+        
         # Load grid-based shaders for O(N) complexity
         self._load_grid_shaders()
         self._setup_grid_system()
@@ -119,6 +122,16 @@ class SimplifiedSimulation:
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
         
         self.fitness_shader = self.ctx.compute_shader(shader_source)
+    
+    def _load_gradient_reset_shader(self):
+        """Load and compile the gradient reset compute shader"""
+        with open('gradient_reset.comp', 'r') as f:
+            shader_source = f.read()
+        
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        
+        self.gradient_reset_shader = self.ctx.compute_shader(shader_source)
     
     def _load_grid_shaders(self):
         """Load and compile grid-based compute shaders for O(N) complexity"""
@@ -422,6 +435,18 @@ class SimplifiedSimulation:
         fitness_output_buffer.release()
         
         return fitness_values
+    
+    def reset_gradient_travel_gpu(self):
+        """Reset gradient travel for all agents using GPU shader (no CPU transfers)"""
+        # Bind current agent buffer
+        self.agents_input_buffer.bind_to_storage_buffer(0)
+        
+        # Execute gradient reset shader
+        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
+        self.gradient_reset_shader.run(num_work_groups, 1, 1)
+        
+        # Memory barrier to ensure reset is complete
+        self.ctx.memory_barrier()
     
     def _update_gpu_buffers_from_agents(self):
         """Update GPU buffers with current agent data"""

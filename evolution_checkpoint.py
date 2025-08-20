@@ -233,10 +233,8 @@ class CheckpointEvolutionSimulation:
         sim.current_time = 0.0
     
     def _reset_gradient_travel(self, sim):
-        """Fast gradient travel reset"""
-        for agent in sim.agents:
-            agent.grad_travel = 0.0
-        sim._update_gpu_buffers_from_agents()
+        """GPU-only gradient travel reset (no CPU transfers)"""
+        sim.reset_gradient_travel_gpu()
     
     def roulette_wheel_selection(self, population, fitness_values):
         """Fitness-proportional selection using softmax"""
