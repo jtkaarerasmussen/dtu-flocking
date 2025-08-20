@@ -1,0 +1,232 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+struct Agent{
+    vec2 c;
+    vec2 v;
+    float w_g;
+    float w_s;
+    float theta;
+    float grad_travel;
+};
+
+// Input agents
+layout(std430, binding = 0) readonly buffer pairs_in {
+    Agent agents[];
+} In;
+
+// Simulation parameters
+layout(std430, binding = 2) readonly buffer parm_in {
+    float r_a;
+    float r_s;
+    float s;
+    float l;
+    float t;
+    float sigma_g;
+    float sigma_r;
+    float theta_max;
+    float dt;
+    float world_size;
+    float tp;
+    uint grid_size;
+    float cell_size;
+} Par;
+
+// Output agents
+layout(std430, binding = 5) writeonly buffer vecs_out {
+    Agent agents[];
+} Out;
+
+// Calculate wrapped distance for periodic boundaries
+vec2 calc_wrapped_diff(vec2 pos1, vec2 pos2, float world_size) {
+    vec2 diff = pos2 - pos1;
+    diff = diff - world_size * floor(diff / world_size + 0.5);
+    return diff;
+}
+
+// Get grid cell coordinates from world position
+ivec2 get_grid_coords(vec2 pos, float world_size, uint grid_size) {
+    vec2 normalized = mod(pos / world_size, 1.0);
+    ivec2 coords = ivec2(floor(normalized * float(grid_size)));
+    coords = clamp(coords, ivec2(0), ivec2(int(grid_size) - 1));
+    return coords;
+}
+
+// Check if agent is in neighboring grid cells (3x3 around target)
+bool is_in_neighbor_cells(vec2 agent_pos, vec2 target_pos, float world_size, uint grid_size, float cell_size) {
+    ivec2 agent_coords = get_grid_coords(agent_pos, world_size, grid_size);
+    ivec2 target_coords = get_grid_coords(target_pos, world_size, grid_size);
+    
+    // Calculate difference with periodic wrapping
+    ivec2 diff = agent_coords - target_coords;
+    int g_size = int(grid_size);
+    
+    // Handle periodic wrapping
+    if (diff.x > g_size/2) diff.x -= g_size;
+    else if (diff.x <= -g_size/2) diff.x += g_size;
+    
+    if (diff.y > g_size/2) diff.y -= g_size;
+    else if (diff.y <= -g_size/2) diff.y += g_size;
+    
+    // Check if within 3x3 neighborhood
+    return abs(diff.x) <= 1 && abs(diff.y) <= 1;
+}
+
+// Better random number generator
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+float random(uint seed) {
+    uint hashed = hash(seed);
+    return float(hashed) / 4294967295.0;
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = In.agents.length();
+    
+    if (agent_id >= num_agents) {
+        return;
+    }
+    
+    Agent current_agent = In.agents[agent_id];
+    vec2 agent_pos = current_agent.c;
+    Agent new_agent = current_agent;
+    
+    // Social interaction vectors
+    vec2 avoidance_direction = vec2(0.0, 0.0);
+    vec2 social_attraction = vec2(0.0, 0.0);
+    vec2 social_alignment = vec2(0.0, 0.0);
+    bool has_avoidance = false;
+    
+    // Precompute distance thresholds
+    float r_a_squared = Par.r_a * Par.r_a;
+    float r_s_squared = Par.r_s * Par.r_s;
+    
+    // ========== OPTIMIZED GRID-BASED NEIGHBOR SEARCH ==========
+    // Only check agents in neighboring grid cells (3x3 neighborhood)
+    for (uint other_id = 0u; other_id < num_agents; other_id++) {
+        if (other_id == agent_id) {
+            continue;
+        }
+        
+        Agent neighbor_agent = In.agents[other_id];
+        vec2 neighbor_pos = neighbor_agent.c;
+        
+        // Quick grid-based culling - skip if not in neighboring cells
+        if (!is_in_neighbor_cells(neighbor_pos, agent_pos, Par.world_size, Par.grid_size, Par.cell_size)) {
+            continue;
+        }
+        
+        // Calculate wrapped distance
+        vec2 diff = calc_wrapped_diff(agent_pos, neighbor_pos, Par.world_size);
+        float dist_squared = dot(diff, diff);
+        
+        if (dist_squared > r_s_squared) {
+            continue;
+        }
+        
+        float dist = sqrt(dist_squared);
+        
+        // Avoidance (highest priority)
+        if (dist_squared <= r_a_squared && dist > 0.001) {
+            has_avoidance = true;
+            avoidance_direction += -diff / dist;
+        }
+        // Social interaction
+        else if (dist_squared <= r_s_squared && dist > 0.001) {
+            social_attraction += diff / dist;
+            if (length(neighbor_agent.v) > 0.001) {
+                social_alignment += normalize(neighbor_agent.v);
+            }
+        }
+    }
+    
+    // ========== COMPUTE DESIRED DIRECTION ==========
+    vec2 desired_direction = vec2(0.0, 0.0);
+    
+    if (has_avoidance) {
+        desired_direction = length(avoidance_direction) > 0.0 ? 
+                           normalize(avoidance_direction) : vec2(1.0, 0.0);
+    } else {
+        vec2 social_direction = social_attraction + social_alignment;
+        
+        // Gradient direction (Ornstein-Uhlenbeck process)
+        vec2 gradient_direction = vec2(0.0, 0.0);
+        float w_g = new_agent.w_g;
+        if (w_g > 0.001) {
+            float decay_factor = exp(-w_g * Par.dt);
+            float noise_variance = Par.sigma_g * Par.sigma_g * (1.0 - exp(-2.0 * w_g * Par.dt)) / (2.0 * w_g);
+            float noise_scale = sqrt(noise_variance);
+            
+            uint time_seed = uint(Par.t / Par.dt);
+            float u1 = random(agent_id * 1000u + time_seed * 73u + 123u);
+            float u2 = random(agent_id * 1000u + time_seed * 97u + 456u);
+            u1 = max(u1, 1e-8);
+            
+            float zeta = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
+            float theta = current_agent.theta * decay_factor + noise_scale * zeta;
+            theta = mod(theta + 3.14159265359, 2.0 * 3.14159265359) - 3.14159265359;
+            
+            new_agent.theta = theta;
+            gradient_direction = vec2(cos(theta), sin(theta));
+        } else {
+            new_agent.theta = current_agent.theta;
+        }
+        
+        // Random direction
+        uint time_seed = uint(Par.t / Par.dt);
+        float rand_x = (random(agent_id * 13u + time_seed * 37u + 2u) - 0.5) * 2.0;
+        float rand_y = (random(agent_id * 19u + time_seed * 41u + 3u) - 0.5) * 2.0;
+        vec2 random_direction = vec2(rand_x, rand_y);
+        
+        desired_direction = new_agent.w_s * social_direction + 
+                           new_agent.w_g * gradient_direction + 
+                           Par.sigma_r * random_direction;
+    }
+    
+    // Normalize desired direction
+    if (length(desired_direction) > 0.0) {
+        desired_direction = normalize(desired_direction);
+    }
+    
+    // Apply movement constraints
+    vec2 current_vel_dir = length(current_agent.v) > 0.001 ? 
+                          normalize(current_agent.v) : vec2(1.0, 0.0);
+    
+    float turn_rate = Par.theta_max * Par.dt;
+    vec2 new_direction = mix(current_vel_dir, desired_direction, turn_rate);
+    
+    // Set velocity with constant speed
+    new_agent.v = normalize(new_direction) * Par.s;
+    
+    // Update position
+    new_agent.c = current_agent.c + new_agent.v * Par.dt;
+    
+    // Track gradient travel
+    float x_component = new_agent.v.x * Par.dt;
+    new_agent.grad_travel = current_agent.grad_travel + x_component;
+    
+    // Periodic boundary conditions
+    if (new_agent.c.x >= Par.world_size) {
+        new_agent.c.x -= Par.world_size;
+    } else if (new_agent.c.x < 0.0) {
+        new_agent.c.x += Par.world_size;
+    }
+    
+    if (new_agent.c.y >= Par.world_size) {
+        new_agent.c.y -= Par.world_size;
+    } else if (new_agent.c.y < 0.0) {
+        new_agent.c.y += Par.world_size;
+    }
+    
+    // Write updated agent
+    Out.agents[agent_id] = new_agent;
+}

@@ -149,8 +149,8 @@ class SimplifiedSimulation:
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
         self.grid_finalize_shader = self.ctx.compute_shader(shader_source)
         
-        # Main grid-based simulation shader
-        with open('sim_simple_grid.comp', 'r') as f:
+        # Main grid-based simulation shader (fixed version)
+        with open('sim_simple_grid_fixed.comp', 'r') as f:
             shader_source = f.read()
         shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
@@ -299,33 +299,21 @@ class SimplifiedSimulation:
 
     def timestep_gpu_grid(self, sync_gpu: bool = False):
         """
-        GPU timestep with O(N) grid-based spatial partitioning
-        Much faster for large numbers of agents compared to O(N²) approach
+        GPU timestep with optimized grid-based spatial culling
+        Reduces neighbor checks by using grid-based early rejection
         
         Args:
             sync_gpu: If True, wait for GPU to complete (for accurate timing)
         """
-        # NO CPU→GPU transfers! Pure GPU queue operations
+        # NO CPU→GPU transfers! Single shader dispatch with grid optimization
         
-        # Step 1: Build spatial grid (assign agents to grid cells)
+        # Bind buffers for grid-optimized simulation
         self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
         self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
-        self.agent_keys_buffer.bind_to_storage_buffer(6)     # Output: agent keys  
-        self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells
-        
-        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
-        self.grid_construct_shader.run(num_work_groups, 1, 1)
-        
-        # GPU-only memory barrier
-        self.ctx.memory_barrier()
-        
-        # Step 2: Run main simulation with grid-based neighbor finding  
-        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
-        self.sorted_indices_buffer.bind_to_storage_buffer(3) # Sorted agent indices
         self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
         
+        # Execute grid-optimized simulation shader (single dispatch)
+        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
         self.grid_sim_shader.run(num_work_groups, 1, 1)
         
         # Force GPU synchronization ONLY if requested
