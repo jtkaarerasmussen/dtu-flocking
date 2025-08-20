@@ -53,7 +53,7 @@ layout(std430, binding = 6) writeonly buffer agent_keys_out {
 } AgentKeys;
 
 // Output: Grid cells (will be filled after sorting)
-layout(std430, binding = 1) writeonly buffer grid_out {
+layout(std430, binding = 1) coherent buffer grid_out {
     GridCell grid[];
 } GridOut;
 
@@ -82,8 +82,15 @@ uint grid_coords_to_key(ivec2 coords, uint grid_size) {
 void main() {
     uint agent_id = gl_GlobalInvocationID.x;
     uint num_agents = In.agents.length();
+    uint total_cells = Par.grid_size * Par.grid_size;
     
-    // Check bounds
+    // Initialize grid cells (first pass)
+    if (agent_id < total_cells) {
+        GridOut.grid[agent_id].start_index = 0;
+        GridOut.grid[agent_id].count = 0;
+    }
+    
+    // Check bounds for agents
     if (agent_id >= num_agents) {
         return;
     }
@@ -95,13 +102,12 @@ void main() {
     ivec2 grid_coords = get_grid_coords(agent_pos, Par.world_size, Par.grid_size);
     uint grid_key = grid_coords_to_key(grid_coords, Par.grid_size);
     
-    // Store agent index and grid key for sorting
+    // Store agent index in sorted indices array (unsorted initially)
     AgentKeys.agent_keys[agent_id].agent_index = agent_id;
     AgentKeys.agent_keys[agent_id].grid_key = grid_key;
     
-    // Initialize grid cells (will be properly filled after sorting)
-    if (agent_id < Par.grid_size * Par.grid_size) {
-        GridOut.grid[agent_id].start_index = 0;
-        GridOut.grid[agent_id].count = 0;
+    // Use atomic increment to count agents per cell
+    if (grid_key < total_cells) {
+        atomicAdd(GridOut.grid[grid_key].count, 1u);
     }
 }

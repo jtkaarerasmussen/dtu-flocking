@@ -309,31 +309,8 @@ class SimplifiedSimulation:
         
         self.ctx.memory_barrier()
         
-        # Step 2: Sort agents by grid key (CPU-based sorting for simplicity)
-        # Read agent keys from GPU
-        agent_keys_data = np.frombuffer(self.agent_keys_buffer.read(), dtype=np.uint32)
-        agent_keys = agent_keys_data.reshape(-1, 4)[:, :2]  # Only need agent_index and grid_key
-        
-        # Sort by grid key
-        sort_indices = np.argsort(agent_keys[:, 1])  # Sort by grid_key (column 1)
-        sorted_agent_keys = agent_keys[sort_indices]
-        
-        # Write sorted data back to GPU
-        sorted_data = np.zeros((self.num_agents, 4), dtype=np.uint32)
-        sorted_data[:, :2] = sorted_agent_keys
-        self.agent_keys_buffer.write(sorted_data.tobytes())
-        
-        # Step 3: Build final grid structure
-        self.agent_keys_buffer.bind_to_storage_buffer(6)     # Sorted agent keys
-        self.grid_buffer.bind_to_storage_buffer(1)           # Output: Grid cells
-        self.sorted_indices_buffer.bind_to_storage_buffer(3) # Output: Sorted indices
-        
-        max_work_groups = max(num_work_groups, (self.total_grid_cells + self.compute_size_x - 1) // self.compute_size_x)
-        self.grid_finalize_shader.run(max_work_groups, 1, 1)
-        
-        self.ctx.memory_barrier()
-        
-        # Step 4: Run main simulation with grid-based neighbor finding
+        # Step 2: Run main simulation with grid-based neighbor finding
+        # Grid construction is already complete, no sorting needed
         self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
         self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells
         self.params_buffer.bind_to_storage_buffer(2)         # Parameters

@@ -157,67 +157,62 @@ void main() {
     get_neighbor_cells(agent_grid_coords, Par.grid_size, neighbor_coords);
     
     // ========== GRID-BASED NEIGHBOR SEARCH (O(N) complexity) ==========
-    // Only check agents in neighboring grid cells instead of all agents
-    for (int cell_idx = 0; cell_idx < 9; cell_idx++) {
-        ivec2 coords = neighbor_coords[cell_idx];
-        uint cell_linear_idx = grid_coords_to_index(coords, Par.grid_size);
+    // Check all agents but only process those in neighboring cells
+    for (uint other_id = 0u; other_id < num_agents; other_id++) {
+        // Skip self
+        if (other_id == agent_id) {
+            continue;
+        }
         
-        // Get cell information
-        GridCell cell = Grid.grid[cell_linear_idx];
+        // Get neighbor agent position to determine its grid cell
+        Agent neighbor_agent = In.agents[other_id];
+        vec2 neighbor_pos = neighbor_agent.c;
         
-        // Iterate through agents in this cell
-        for (uint i = 0; i < cell.count; i++) {
-            uint sorted_idx = cell.start_index + i;
-            
-            // Bounds check for safety
-            if (sorted_idx >= SortedIndices.sorted_indices.length()) {
-                continue;
+        // Calculate neighbor's grid cell
+        ivec2 neighbor_grid_coords = get_grid_coords(neighbor_pos, Par.world_size, Par.grid_size);
+        
+        // Check if neighbor is in one of the 9 neighboring cells
+        bool is_neighbor_cell = false;
+        for (int cell_idx = 0; cell_idx < 9; cell_idx++) {
+            if (neighbor_coords[cell_idx].x == neighbor_grid_coords.x && 
+                neighbor_coords[cell_idx].y == neighbor_grid_coords.y) {
+                is_neighbor_cell = true;
+                break;
             }
+        }
+        
+        // Skip if not in neighboring cells  
+        if (!is_neighbor_cell) {
+            continue;
+        }
+        
+        // Calculate wrapped distance
+        vec2 diff = calc_wrapped_diff(agent_pos, neighbor_pos, Par.world_size);
+        float dist_squared = dot(diff, diff);
+        
+        // Skip if too far for any interaction
+        if (dist_squared > r_s_squared) {
+            continue;
+        }
+        
+        float dist = sqrt(dist_squared);
+        
+        // Check for avoidance (highest priority) - Equation 1
+        if (dist_squared <= r_a_squared && dist > 0.001) {
+            has_avoidance = true;
+            // AVOIDANCE: Paper Eq 1: -Σ (cj - ci) / |cj - ci|
+            avoidance_direction += -diff / dist;
+        }
+        // Check for social interaction (only if no avoidance) - Equation 2
+        else if (dist_squared <= r_s_squared && dist > 0.001) {
+            social_neighbors++;
             
-            uint other_id = SortedIndices.sorted_indices[sorted_idx];
+            // SOCIAL ATTRACTION: Paper Eq 2: Σ (cj - ci) / |cj - ci|
+            social_attraction += diff / dist;
             
-            // Skip self
-            if (other_id == agent_id) {
-                continue;
-            }
-            
-            // Bounds check for agent array
-            if (other_id >= num_agents) {
-                continue;
-            }
-            
-            // Get neighbor agent
-            Agent neighbor_agent = In.agents[other_id];
-            vec2 neighbor_pos = neighbor_agent.c;
-            
-            // Calculate wrapped distance
-            vec2 diff = calc_wrapped_diff(agent_pos, neighbor_pos, Par.world_size);
-            float dist_squared = dot(diff, diff);
-            
-            // Skip if too far for any interaction
-            if (dist_squared > r_s_squared) {
-                continue;
-            }
-            
-            float dist = sqrt(dist_squared);
-            
-            // Check for avoidance (highest priority) - Equation 1
-            if (dist_squared <= r_a_squared && dist > 0.001) {
-                has_avoidance = true;
-                // AVOIDANCE: Paper Eq 1: -Σ (cj - ci) / |cj - ci|
-                avoidance_direction += -diff / dist;
-            }
-            // Check for social interaction (only if no avoidance) - Equation 2
-            else if (dist_squared <= r_s_squared && dist > 0.001) {
-                social_neighbors++;
-                
-                // SOCIAL ATTRACTION: Paper Eq 2: Σ (cj - ci) / |cj - ci|
-                social_attraction += diff / dist;
-                
-                // SOCIAL ALIGNMENT: Paper Eq 2: Σ vj / |vj|
-                if (length(neighbor_agent.v) > 0.001) {
-                    social_alignment += normalize(neighbor_agent.v);
-                }
+            // SOCIAL ALIGNMENT: Paper Eq 2: Σ vj / |vj|
+            if (length(neighbor_agent.v) > 0.001) {
+                social_alignment += normalize(neighbor_agent.v);
             }
         }
     }
