@@ -237,53 +237,50 @@ class SimplifiedSimulation:
         Args:
             sync_gpu: If True, wait for GPU to complete (for accurate timing)
         """
-        # Update time parameter
-        self._update_params_buffer()
+        # NO CPU→GPU transfers! GPU tracks its own time
         
-        # Bind buffers to shader
+        # Bind buffers to shader (buffers already bound, but rebind for safety)
         self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters
+        self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
         self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
         
-        # Execute simulation shader (single pass)
+        # Execute simulation shader (single pass) - GPU updates time internally
         num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
         self.sim_shader.run(num_work_groups, 1, 1)
         
-        # Force GPU synchronization
+        # Force GPU synchronization ONLY if requested
         if sync_gpu:
             self.ctx.finish()
         
+        # Memory barrier (GPU-only operation)
         self.ctx.memory_barrier()
         
-        # Update time and swap buffers
+        # Update CPU time tracker and swap buffers (no GPU transfer)
         self.current_time += self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
     
     def timestep_gpu_batched(self, batch_size: int = 10, sync_gpu: bool = False):
         """Run multiple timesteps in a single GPU dispatch for better performance"""
-        # Update batch parameters
-        batch_data = struct.pack('if', batch_size, self.current_time)
-        self.batch_params_buffer.write(batch_data)
+        # NO CPU→GPU transfers during batched execution!
         
-        # Bind buffers for batched shader
+        # Bind buffers for batched shader (static bindings)
         self.agents_input_buffer.bind_to_storage_buffer(0)    # Input agents
-        self._update_params_buffer()
-        self.params_buffer.bind_to_storage_buffer(2)          # Simulation parameters
-        self.batch_params_buffer.bind_to_storage_buffer(6)    # Batch parameters  
+        self.params_buffer.bind_to_storage_buffer(2)          # Simulation parameters (static)
+        self.batch_params_buffer.bind_to_storage_buffer(6)    # Batch parameters (pre-set)
         self.agents_output_buffer.bind_to_storage_buffer(5)   # Output agents
         
-        # Execute batched simulation shader
+        # Execute batched simulation shader - GPU handles time internally
         num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
         self.batched_shader.run(num_work_groups, 1, 1)
         
-        # Force GPU synchronization 
+        # Force GPU synchronization ONLY if requested
         if sync_gpu:
             self.ctx.finish()
         
-        # Memory barrier for correct grad_travel accumulation
+        # Memory barrier (GPU-only operation)
         self.ctx.memory_barrier()
         
-        # Update time and swap buffers
+        # Update CPU time tracker and swap buffers (no GPU transfer)
         self.current_time += batch_size * self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
 
@@ -295,37 +292,37 @@ class SimplifiedSimulation:
         Args:
             sync_gpu: If True, wait for GPU to complete (for accurate timing)
         """
-        # Update time parameter
-        self._update_params_buffer()
+        # NO CPU→GPU transfers! Pure GPU queue operations
         
         # Step 1: Build spatial grid (assign agents to grid cells)
         self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters  
-        self.agent_keys_buffer.bind_to_storage_buffer(6)     # Output: agent keys
-        self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells (for initialization)
+        self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
+        self.agent_keys_buffer.bind_to_storage_buffer(6)     # Output: agent keys  
+        self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells
         
         num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
         self.grid_construct_shader.run(num_work_groups, 1, 1)
         
+        # GPU-only memory barrier
         self.ctx.memory_barrier()
         
-        # Step 2: Run main simulation with grid-based neighbor finding
-        # Grid construction is already complete, no sorting needed
+        # Step 2: Run main simulation with grid-based neighbor finding  
         self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
         self.grid_buffer.bind_to_storage_buffer(1)           # Grid cells
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters
-        self.sorted_indices_buffer.bind_to_storage_buffer(3) # Sorted agent indices  
+        self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
+        self.sorted_indices_buffer.bind_to_storage_buffer(3) # Sorted agent indices
         self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
         
         self.grid_sim_shader.run(num_work_groups, 1, 1)
         
-        # Force GPU synchronization
+        # Force GPU synchronization ONLY if requested
         if sync_gpu:
             self.ctx.finish()
         
+        # GPU-only memory barrier
         self.ctx.memory_barrier()
         
-        # Update time and swap buffers
+        # Update CPU time tracker and swap buffers (no GPU transfer)
         self.current_time += self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
 
