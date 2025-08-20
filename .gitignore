@@ -5,5 +5,5 @@
 !*.py
 !*.comp
 !*.ipynb
-
+!cupy_test/*
 
