@@ -1,0 +1,82 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+struct Agent{
+    vec2 c;
+    vec2 v;
+    float w_g;
+    float w_s;
+    float theta;
+    float grad_travel;
+};
+
+// Agent buffer (read-write)
+layout(std430, binding = 0) buffer agents_buffer {
+    Agent agents[];
+} Agents;
+
+// Reset parameters
+layout(std430, binding = 1) readonly buffer reset_params_buffer {
+    float world_size;
+    float speed;
+    uint time_seed;
+    uint num_agents;
+} ResetParams;
+
+// Phenotype data (w_g, w_s for each agent)
+layout(std430, binding = 2) readonly buffer phenotypes_buffer {
+    float phenotypes[];  // [w_g0, w_s0, w_g1, w_s1, ...]
+} Phenotypes;
+
+// Hash function for random number generation
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+float random(uint seed) {
+    uint hashed = hash(seed);
+    return float(hashed) / 4294967295.0;
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    
+    if (agent_id >= ResetParams.num_agents) {
+        return;
+    }
+    
+    // Generate random position
+    uint pos_seed_x = agent_id * 1000u + ResetParams.time_seed * 73u + 123u;
+    uint pos_seed_y = agent_id * 1000u + ResetParams.time_seed * 97u + 456u;
+    
+    float x = random(pos_seed_x) * ResetParams.world_size;
+    float y = random(pos_seed_y) * ResetParams.world_size;
+    
+    // Generate random velocity direction
+    uint vel_seed = agent_id * 1000u + ResetParams.time_seed * 137u + 789u;
+    float theta = random(vel_seed) * 2.0 * 3.14159265359;
+    
+    float vx = ResetParams.speed * cos(theta);
+    float vy = ResetParams.speed * sin(theta);
+    
+    // Set agent state
+    Agents.agents[agent_id].c = vec2(x, y);
+    Agents.agents[agent_id].v = vec2(vx, vy);
+    
+    // Set phenotypes from buffer
+    uint phenotype_idx = agent_id * 2u;
+    if (phenotype_idx + 1u < Phenotypes.phenotypes.length()) {
+        Agents.agents[agent_id].w_g = Phenotypes.phenotypes[phenotype_idx];
+        Agents.agents[agent_id].w_s = Phenotypes.phenotypes[phenotype_idx + 1u];
+    }
+    
+    // Reset other fields
+    Agents.agents[agent_id].theta = theta;
+    Agents.agents[agent_id].grad_travel = 0.0;
+}

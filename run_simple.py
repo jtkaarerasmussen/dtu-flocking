@@ -81,6 +81,9 @@ class SimplifiedSimulation:
         # Load gradient reset shader
         self._load_gradient_reset_shader()
         
+        # Load agent reset shader for GPU-only population reset
+        self._load_agent_reset_shader()
+        
         # Load grid-based shaders for O(N) complexity
         self._load_grid_shaders()
         self._setup_grid_system()
@@ -132,6 +135,16 @@ class SimplifiedSimulation:
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
         
         self.gradient_reset_shader = self.ctx.compute_shader(shader_source)
+    
+    def _load_agent_reset_shader(self):
+        """Load and compile the agent reset compute shader"""
+        with open('agent_reset.comp', 'r') as f:
+            shader_source = f.read()
+        
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        
+        self.agent_reset_shader = self.ctx.compute_shader(shader_source)
     
     def _load_grid_shaders(self):
         """Load and compile grid-based compute shaders for O(N) complexity"""
@@ -435,6 +448,39 @@ class SimplifiedSimulation:
         
         # Memory barrier to ensure reset is complete
         self.ctx.memory_barrier()
+    
+    def reset_agents_gpu(self, population, world_size: float, speed: float):
+        """Reset all agents on GPU without CPU transfers (ELIMINATES MAJOR BOTTLENECK)"""
+        import time
+        
+        # Create phenotype data buffer (w_g, w_s pairs)
+        phenotype_data = np.zeros(len(population) * 2, dtype=np.float32)
+        for i, individual in enumerate(population):
+            phenotype_data[i * 2] = individual['w_g']
+            phenotype_data[i * 2 + 1] = individual['w_s']
+        
+        phenotype_buffer = self.ctx.buffer(phenotype_data.tobytes())
+        
+        # Create reset parameters
+        time_seed = int(time.time() * 1000) % 100000
+        reset_params = struct.pack('ffII', world_size, speed, time_seed, len(population))
+        reset_params_buffer = self.ctx.buffer(reset_params)
+        
+        # Bind buffers
+        self.agents_input_buffer.bind_to_storage_buffer(0)  # Agent data (read-write)
+        reset_params_buffer.bind_to_storage_buffer(1)       # Reset parameters
+        phenotype_buffer.bind_to_storage_buffer(2)          # Phenotype data
+        
+        # Execute reset shader
+        num_work_groups = (len(population) + self.compute_size_x - 1) // self.compute_size_x
+        self.agent_reset_shader.run(num_work_groups, 1, 1)
+        
+        # Memory barrier
+        self.ctx.memory_barrier()
+        
+        # Cleanup temporary buffers
+        reset_params_buffer.release()
+        phenotype_buffer.release()
     
     def _update_gpu_buffers_from_agents(self):
         """Update GPU buffers with current agent data"""

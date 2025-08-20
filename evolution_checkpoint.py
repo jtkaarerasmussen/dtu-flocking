@@ -211,25 +211,9 @@ class CheckpointEvolutionSimulation:
         return fitness_sum / self.nr
     
     def _reset_simulation_state(self, sim, population):
-        """Fast reset without GPU context recreation"""
-        for i, individual in enumerate(population):
-            # Random position
-            sim.agents[i].c[0] = np.random.uniform(0, self.world_size)
-            sim.agents[i].c[1] = np.random.uniform(0, self.world_size)
-            
-            # Random velocity
-            theta = np.random.uniform(0, 2 * np.pi)
-            speed = self.r_a
-            sim.agents[i].v[0] = speed * np.cos(theta)
-            sim.agents[i].v[1] = speed * np.sin(theta)
-            
-            # Set phenotypes
-            sim.agents[i].w_g = individual['w_g']
-            sim.agents[i].w_s = individual['w_s']
-            sim.agents[i].grad_travel = 0.0
-        
-        # Update GPU buffers once
-        sim._update_gpu_buffers_from_agents()
+        """GPU-only reset - ELIMINATES MAJOR A100 BOTTLENECK!"""
+        # Reset agents entirely on GPU (no CPU-GPU transfers!)
+        sim.reset_agents_gpu(population, self.world_size, self.r_a)
         sim.current_time = 0.0
     
     def _reset_gradient_travel(self, sim):
@@ -341,7 +325,7 @@ class CheckpointEvolutionSimulation:
         for gen_offset in range(num_generations):
             self.generation = start_generation + gen_offset
             
-            if verbose and self.generation % 5 == 0:
+            if verbose and self.generation % 1 == 0:
                 elapsed = time.time() - start_time
                 if gen_offset > 0:
                     est_total = elapsed * num_generations / gen_offset
