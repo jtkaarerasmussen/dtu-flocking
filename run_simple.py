@@ -75,6 +75,9 @@ class SimplifiedSimulation:
         # Load simulation shader
         self._load_sim_shader()
         
+        # Load branchless simulation shader for A100 optimization
+        self._load_branchless_shader()
+        
         # Load fitness shader
         self._load_fitness_shader()
         
@@ -105,6 +108,16 @@ class SimplifiedSimulation:
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
         
         self.sim_shader = self.ctx.compute_shader(shader_source)
+    
+    def _load_branchless_shader(self):
+        """Load and compile the branchless simulation compute shader for A100"""
+        with open('sim_branchless.comp', 'r') as f:
+            shader_source = f.read()
+        
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        
+        self.branchless_shader = self.ctx.compute_shader(shader_source)
     
     def _load_batched_shader(self):
         """Load and compile the batched simulation compute shader"""
@@ -337,6 +350,34 @@ class SimplifiedSimulation:
         self.ctx.memory_barrier()
         
         # Update CPU time tracker and swap buffers (no GPU transfer)
+        self.current_time += self.dt
+        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
+
+    def timestep_gpu_branchless(self, sync_gpu: bool = False):
+        """
+        GPU timestep with branchless shader optimized for A100 branch divergence
+        Eliminates all if/else statements that cause warp divergence
+        """
+        # Update parameters buffer with current time
+        self._update_params_buffer()
+        
+        # Bind buffers
+        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
+        self.params_buffer.bind_to_storage_buffer(2)         # Parameters
+        self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
+        
+        # Execute branchless simulation shader
+        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
+        self.branchless_shader.run(num_work_groups, 1, 1)
+        
+        # Force GPU synchronization ONLY if requested
+        if sync_gpu:
+            self.ctx.finish()
+        
+        # Memory barrier
+        self.ctx.memory_barrier()
+        
+        # Update CPU time tracker and swap buffers
         self.current_time += self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
 

@@ -12,7 +12,7 @@ def benchmark_timesteps():
     NUM_TIMESTEPS = 100  # Test duration
     
     # Different agent counts to test
-    agent_counts = [64, 256, 640, 1024, 2560, 6400]
+    agent_counts = [64, 256, 640, 1024, 2560, 6400,16000,30000]
     
     results = []
     
@@ -62,6 +62,41 @@ def benchmark_timesteps():
             print(f"  O(N²) method:  ERROR - {e}")
             timesteps_per_sec = 0
             agent_timesteps_per_sec = 0
+        
+        # Test branchless method (A100 optimized)
+        try:
+            sim = SimplifiedSimulation(
+                world_size=WORLD_SIZE,
+                num_agents=num_agents,
+                r_a=r_a, r_s=r_s, s=r_a,
+                sigma_g=0.447, sigma_r=1.0,
+                theta_max=2.0, dt=0.2, tp=100.0,
+                compute_size_x=256
+            )
+            
+            # Warm up
+            for _ in range(5):
+                sim.timestep_gpu_branchless()
+            
+            # Benchmark branchless method
+            start_time = time.time()
+            for _ in range(NUM_TIMESTEPS):
+                sim.timestep_gpu_branchless()
+            sim.ctx.finish()  # FORCE GPU to complete all work before measuring time
+            end_time = time.time()
+            
+            total_time = end_time - start_time
+            branchless_timesteps_per_sec = NUM_TIMESTEPS / total_time
+            branchless_agent_timesteps_per_sec = num_agents * branchless_timesteps_per_sec
+            
+            print(f"  Branchless:    {branchless_timesteps_per_sec:.1f} timesteps/sec, {branchless_agent_timesteps_per_sec:.0f} agent-timesteps/sec")
+            
+            sim.cleanup()
+            
+        except Exception as e:
+            print(f"  Branchless:    ERROR - {e}")
+            branchless_timesteps_per_sec = 0
+            branchless_agent_timesteps_per_sec = 0
         
         # Test grid method
         try:

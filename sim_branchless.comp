@@ -1,0 +1,185 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+struct Agent{
+    vec2 c;
+    vec2 v;
+    float w_g;
+    float w_s;
+    float theta;
+    float grad_travel;
+};
+
+layout(std430, binding = 0) readonly buffer pairs_in {
+    Agent agents[];
+} In;
+
+layout(std430, binding = 2) readonly buffer parm_in {
+    float r_a;
+    float r_s;
+    float s;
+    float l;
+    float t;
+    float sigma_g;
+    float sigma_r;
+    float theta_max;
+    float dt;
+    float world_size;
+    float tp;
+    uint grid_size;
+    float cell_size;
+} Par;
+
+layout(std430, binding = 5) writeonly buffer vecs_out {
+    Agent agents[];
+} Out;
+
+// Calculate wrapped distance for periodic boundaries
+vec2 calc_wrapped_diff(vec2 pos1, vec2 pos2, float world_size) {
+    vec2 diff = pos2 - pos1;
+    diff = diff - world_size * floor(diff / world_size + 0.5);
+    return diff;
+}
+
+// Smooth step functions for branchless transitions
+float smooth_avoidance_weight(float dist_sq, float r_a_sq) {
+    // Returns 1.0 for distances <= r_a, 0.0 for distances > r_a
+    return 1.0 - smoothstep(0.0, r_a_sq, dist_sq);
+}
+
+float smooth_social_weight(float dist_sq, float r_a_sq, float r_s_sq) {
+    // Returns 0.0 for distances <= r_a, 1.0 for r_a < distances <= r_s, 0.0 for distances > r_s
+    float avoidance_mask = smoothstep(0.0, r_a_sq, dist_sq);
+    float social_mask = 1.0 - smoothstep(r_s_sq * 0.9, r_s_sq, dist_sq);
+    return avoidance_mask * social_mask;
+}
+
+// Hash function for random number generation
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+float random(uint seed) {
+    uint hashed = hash(seed);
+    return float(hashed) / 4294967295.0;
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = In.agents.length();
+    
+    if (agent_id >= num_agents) {
+        return;
+    }
+    
+    Agent current_agent = In.agents[agent_id];
+    vec2 agent_pos = current_agent.c;
+    Agent new_agent = current_agent;
+    
+    // Accumulate forces (branchless)
+    vec2 avoidance_force = vec2(0.0);
+    vec2 social_force = vec2(0.0);
+    float total_avoidance_weight = 0.0;
+    float total_social_weight = 0.0;
+    
+    float r_a_squared = Par.r_a * Par.r_a;
+    float r_s_squared = Par.r_s * Par.r_s;
+    
+    // BRANCHLESS NEIGHBOR INTERACTION
+    for (uint other_id = 0u; other_id < num_agents; other_id++) {
+        // Skip self (weight will be 0 anyway due to dist=0)
+        float self_mask = 1.0 - float(other_id == agent_id);
+        
+        Agent neighbor_agent = In.agents[other_id];
+        vec2 diff = calc_wrapped_diff(agent_pos, neighbor_agent.c, Par.world_size);
+        float dist_squared = dot(diff, diff) + 1e-6; // Avoid division by zero
+        float dist = sqrt(dist_squared);
+        
+        // Branchless weight calculation
+        float avoid_weight = smooth_avoidance_weight(dist_squared, r_a_squared) * self_mask;
+        float social_weight = smooth_social_weight(dist_squared, r_a_squared, r_s_squared) * self_mask;
+        
+        // Accumulate forces (always executed, no branches)
+        vec2 unit_diff = diff / dist;
+        avoidance_force += -unit_diff * avoid_weight;
+        social_force += unit_diff * social_weight;
+        
+        // Alignment force (part of social)
+        float vel_length = length(neighbor_agent.v);
+        vec2 neighbor_vel_norm = neighbor_agent.v / max(vel_length, 1e-6);
+        social_force += neighbor_vel_norm * social_weight * 0.5;
+        
+        total_avoidance_weight += avoid_weight;
+        total_social_weight += social_weight;
+    }
+    
+    // Normalize forces
+    avoidance_force = avoidance_force / max(total_avoidance_weight, 1e-6);
+    social_force = social_force / max(total_social_weight, 1e-6);
+    
+    // BRANCHLESS BEHAVIOR BLENDING
+    float avoidance_strength = min(total_avoidance_weight, 1.0); // Cap at 1.0
+    float social_strength = (1.0 - avoidance_strength) * min(total_social_weight * 0.1, 1.0);
+    
+    // Gradient direction (Ornstein-Uhlenbeck process)
+    vec2 gradient_direction = vec2(0.0);
+    float w_g = new_agent.w_g;
+    
+    // Branchless gradient computation
+    float has_gradient = step(0.001, w_g); // 1.0 if w_g > 0.001, 0.0 otherwise
+    
+    float decay_factor = exp(-w_g * Par.dt);
+    float noise_variance = Par.sigma_g * Par.sigma_g * (1.0 - exp(-2.0 * w_g * Par.dt)) / max(2.0 * w_g, 1e-6);
+    float noise_scale = sqrt(noise_variance);
+    
+    uint time_seed = uint(Par.t / Par.dt);
+    float u1 = random(agent_id * 1000u + time_seed * 73u + 123u);
+    float u2 = random(agent_id * 1000u + time_seed * 97u + 456u);
+    u1 = max(u1, 1e-8);
+    
+    float zeta = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
+    float theta = current_agent.theta * decay_factor + noise_scale * zeta;
+    theta = mod(theta + 3.14159265359, 2.0 * 3.14159265359) - 3.14159265359;
+    
+    new_agent.theta = current_agent.theta * (1.0 - has_gradient) + theta * has_gradient;
+    gradient_direction = vec2(cos(new_agent.theta), sin(new_agent.theta)) * has_gradient;
+    
+    // Random direction
+    float rand_x = (random(agent_id * 13u + time_seed * 37u + 2u) - 0.5) * 2.0;
+    float rand_y = (random(agent_id * 19u + time_seed * 41u + 3u) - 0.5) * 2.0;
+    vec2 random_direction = vec2(rand_x, rand_y);
+    
+    // BRANCHLESS DIRECTION BLENDING
+    vec2 combined_direction = 
+        avoidance_force * avoidance_strength +
+        social_force * new_agent.w_s * social_strength +
+        gradient_direction * new_agent.w_g * (1.0 - avoidance_strength) +
+        random_direction * Par.sigma_r * (1.0 - avoidance_strength);
+    
+    // Normalize
+    vec2 desired_direction = normalize(combined_direction + vec2(1e-6, 0.0)); // Avoid zero vector
+    
+    // Apply turning rate limit
+    vec2 current_vel_dir = normalize(current_agent.v + vec2(1e-6, 0.0));
+    float turn_rate = Par.theta_max * Par.dt;
+    vec2 new_direction = mix(current_vel_dir, desired_direction, turn_rate);
+    
+    // Update velocity and position
+    new_agent.v = normalize(new_direction) * Par.s;
+    new_agent.c = current_agent.c + new_agent.v * Par.dt;
+    
+    // Track gradient travel
+    new_agent.grad_travel = current_agent.grad_travel + new_agent.v.x * Par.dt;
+    
+    // Periodic boundaries (branchless)
+    new_agent.c.x = mod(new_agent.c.x + Par.world_size, Par.world_size);
+    new_agent.c.y = mod(new_agent.c.y + Par.world_size, Par.world_size);
+    
+    Out.agents[agent_id] = new_agent;
+}
