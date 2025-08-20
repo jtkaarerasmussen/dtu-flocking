@@ -387,7 +387,7 @@ class SimplifiedSimulation:
             Array of fitness values for each agent
         """
         # Force GPU synchronization
-        self.ctx.finish()
+        # self.ctx.finish()
         
         # Determine evaluation time
         if fitness_eval_time is not None:
