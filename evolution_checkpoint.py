@@ -180,7 +180,7 @@ class CheckpointEvolutionSimulation:
                 theta_max=2.0,
                 dt=0.2,
                 tp=100.0,
-                compute_size_x=32
+                compute_size_x=256
             )
         
         sim = self._sim
