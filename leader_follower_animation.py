@@ -92,7 +92,7 @@ def create_leader_follower_animation(num_agents=100, num_leaders=8, timesteps=15
     
     for step in range(timesteps):
         # Use two-pass grid-based O(N) timestep for optimal performance
-        sim.timestep_gpu_two_pass_grid()
+        sim.timestep()
         
         # Save data for animation
         if step % save_interval == 0:

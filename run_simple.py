@@ -231,7 +231,7 @@ class SimplifiedSimulation:
         else:
             self.params_buffer = self.ctx.buffer(param_data)
     
-    def timestep_gpu_two_pass_grid(self, sync_gpu: bool = False):
+    def timestep(self, sync_gpu: bool = False):
         """
         True O(N) grid-based timestep using two-pass approach:
         1. Build spatial grid from agent positions
