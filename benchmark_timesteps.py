@@ -98,6 +98,41 @@ def benchmark_timesteps():
             branchless_timesteps_per_sec = 0
             branchless_agent_timesteps_per_sec = 0
         
+        # Test shared memory method (Memory bandwidth optimized)
+        try:
+            sim = SimplifiedSimulation(
+                world_size=WORLD_SIZE,
+                num_agents=num_agents,
+                r_a=r_a, r_s=r_s, s=r_a,
+                sigma_g=0.447, sigma_r=1.0,
+                theta_max=2.0, dt=0.2, tp=100.0,
+                compute_size_x=256
+            )
+            
+            # Warm up
+            for _ in range(5):
+                sim.timestep_gpu_shared_memory()
+            
+            # Benchmark shared memory method
+            start_time = time.time()
+            for _ in range(NUM_TIMESTEPS):
+                sim.timestep_gpu_shared_memory()
+            sim.ctx.finish()  # FORCE GPU to complete all work before measuring time
+            end_time = time.time()
+            
+            total_time = end_time - start_time
+            shared_mem_timesteps_per_sec = NUM_TIMESTEPS / total_time
+            shared_mem_agent_timesteps_per_sec = num_agents * shared_mem_timesteps_per_sec
+            
+            print(f"  Shared Mem:    {shared_mem_timesteps_per_sec:.1f} timesteps/sec, {shared_mem_agent_timesteps_per_sec:.0f} agent-timesteps/sec")
+            
+            sim.cleanup()
+            
+        except Exception as e:
+            print(f"  Shared Mem:    ERROR - {e}")
+            shared_mem_timesteps_per_sec = 0
+            shared_mem_agent_timesteps_per_sec = 0
+        
         # Test grid method
         try:
             sim = SimplifiedSimulation(
