@@ -188,16 +188,16 @@ class CheckpointEvolutionSimulation:
         for run in range(self.nr):
             self._reset_simulation_state(sim, population)
             
-            # Run transient period using two-pass grid-based timesteps
+            # Run transient period using grid-based timesteps
             for _ in range(self.tau_tr):
-                sim.timestep_gpu_two_pass_grid()
+                sim.timestep()
             
             # Reset gradient travel for fitness evaluation
             self._reset_gradient_travel(sim)
             
-            # Run fitness evaluation period using two-pass grid-based timesteps
+            # Run fitness evaluation period using grid-based timesteps
             for _ in range(self.tau_fit):
-                sim.timestep_gpu_two_pass_grid()
+                sim.timestep()
             
             # Calculate fitness on GPU
             run_fitness = sim.calculate_fitness_gpu(
