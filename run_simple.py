@@ -72,14 +72,6 @@ class SimplifiedSimulation:
             'tp': tp
         }
         
-        # Load simulation shader
-        self._load_sim_shader()
-        
-        # Load branchless simulation shader for A100 optimization
-        self._load_branchless_shader()
-        
-        # Load shared memory shader for memory bandwidth optimization
-        self._load_shared_memory_shader()
         
         # Load fitness shader
         self._load_fitness_shader()
@@ -98,50 +90,6 @@ class SimplifiedSimulation:
         self.agents = self._generate_random_agents(num_agents)
         self._setup_buffers()
         
-        # Load batched shader
-        self._load_batched_shader()
-        
-    
-    def _load_sim_shader(self):
-        """Load and compile the simplified simulation compute shader"""
-        with open('sim_simple.comp', 'r') as f:
-            shader_source = f.read()
-        
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        
-        self.sim_shader = self.ctx.compute_shader(shader_source)
-    
-    def _load_branchless_shader(self):
-        """Load and compile the branchless simulation compute shader for A100"""
-        with open('sim_branchless.comp', 'r') as f:
-            shader_source = f.read()
-        
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        
-        self.branchless_shader = self.ctx.compute_shader(shader_source)
-    
-    def _load_shared_memory_shader(self):
-        """Load and compile the shared memory optimized compute shader"""
-        with open('sim_shared_memory.comp', 'r') as f:
-            shader_source = f.read()
-        
-        # Note: This shader uses fixed 64-thread workgroup for optimal shared memory
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', '64')
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        
-        self.shared_memory_shader = self.ctx.compute_shader(shader_source)
-    
-    def _load_batched_shader(self):
-        """Load and compile the batched simulation compute shader"""
-        with open('sim_batched.comp', 'r') as f:
-            shader_source = f.read()
-        
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        
-        self.batched_shader = self.ctx.compute_shader(shader_source)
     
     def _load_fitness_shader(self):
         """Load and compile the fitness compute shader"""
@@ -175,33 +123,6 @@ class SimplifiedSimulation:
     
     def _load_grid_shaders(self):
         """Load and compile grid-based compute shaders for O(N) complexity"""
-        # Grid construction shader
-        with open('grid_construct.comp', 'r') as f:
-            shader_source = f.read()
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        self.grid_construct_shader = self.ctx.compute_shader(shader_source)
-        
-        # Grid finalization shader  
-        with open('grid_finalize.comp', 'r') as f:
-            shader_source = f.read()
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        self.grid_finalize_shader = self.ctx.compute_shader(shader_source)
-        
-        # Main grid-based simulation shader (fixed version)
-        with open('sim_simple_grid_fixed.comp', 'r') as f:
-            shader_source = f.read()
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        self.grid_sim_shader = self.ctx.compute_shader(shader_source)
-        
-        # Branchless grid-based simulation shader (A100 optimized)
-        with open('sim_branchless_grid.comp', 'r') as f:
-            shader_source = f.read()
-        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
-        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
-        self.branchless_grid_shader = self.ctx.compute_shader(shader_source)
         
         # True grid-based shaders (two-pass approach)
         with open('grid_build.comp', 'r') as f:
@@ -310,158 +231,6 @@ class SimplifiedSimulation:
         else:
             self.params_buffer = self.ctx.buffer(param_data)
     
-    def timestep_gpu_only(self, sync_gpu: bool = False):
-        """
-        Pure GPU timestep - no CPU transfers, maximum performance
-        Uses simplified O(N²) neighbor search instead of complex grid system
-        
-        Args:
-            sync_gpu: If True, wait for GPU to complete (for accurate timing)
-        """
-        # NO CPU→GPU transfers! GPU tracks its own time
-        
-        # Bind buffers to shader (buffers already bound, but rebind for safety)
-        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
-        self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
-        
-        # Execute simulation shader (single pass) - GPU updates time internally
-        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
-        self.sim_shader.run(num_work_groups, 1, 1)
-        
-        # Force GPU synchronization ONLY if requested
-        if sync_gpu:
-            self.ctx.finish()
-        
-        # Memory barrier (GPU-only operation)
-        self.ctx.memory_barrier()
-        
-        # Update CPU time tracker and swap buffers (no GPU transfer)
-        self.current_time += self.dt
-        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
-    
-    def timestep_gpu_batched(self, batch_size: int = 10, sync_gpu: bool = False):
-        """Run multiple timesteps in a single GPU dispatch for better performance"""
-        # NO CPU→GPU transfers during batched execution!
-        
-        # Bind buffers for batched shader (static bindings)
-        self.agents_input_buffer.bind_to_storage_buffer(0)    # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)          # Simulation parameters (static)
-        self.batch_params_buffer.bind_to_storage_buffer(6)    # Batch parameters (pre-set)
-        self.agents_output_buffer.bind_to_storage_buffer(5)   # Output agents
-        
-        # Execute batched simulation shader - GPU handles time internally
-        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
-        self.batched_shader.run(num_work_groups, 1, 1)
-        
-        # Force GPU synchronization ONLY if requested
-        if sync_gpu:
-            self.ctx.finish()
-        
-        # Memory barrier (GPU-only operation)
-        self.ctx.memory_barrier()
-        
-        # Update CPU time tracker and swap buffers (no GPU transfer)
-        self.current_time += batch_size * self.dt
-        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
-
-    def timestep_gpu_grid(self, sync_gpu: bool = False):
-        """
-        GPU timestep with optimized grid-based spatial culling
-        Reduces neighbor checks by using grid-based early rejection
-        
-        Args:
-            sync_gpu: If True, wait for GPU to complete (for accurate timing)
-        """
-        # NO CPU→GPU transfers! Single shader dispatch with grid optimization
-        
-        # Bind buffers for grid-optimized simulation
-        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters (static)
-        self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
-        
-        # Execute grid-optimized simulation shader (single dispatch)
-        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
-        self.grid_sim_shader.run(num_work_groups, 1, 1)
-        
-        # Force GPU synchronization ONLY if requested
-        if sync_gpu:
-            self.ctx.finish()
-        
-        # GPU-only memory barrier
-        self.ctx.memory_barrier()
-        
-        # Update CPU time tracker and swap buffers (no GPU transfer)
-        self.current_time += self.dt
-        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
-
-    def timestep_gpu_branchless(self, sync_gpu: bool = False):
-        """
-        GPU timestep with branchless shader optimized for A100 branch divergence
-        Eliminates all if/else statements that cause warp divergence
-        """
-        # Update parameters buffer with current time
-        self._update_params_buffer()
-        
-        # Bind buffers
-        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters
-        self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
-        
-        # Execute branchless simulation shader
-        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
-        self.branchless_shader.run(num_work_groups, 1, 1)
-        
-        # Force GPU synchronization ONLY if requested
-        if sync_gpu:
-            self.ctx.finish()
-        
-        # Memory barrier
-        self.ctx.memory_barrier()
-        
-        # Update CPU time tracker and swap buffers
-        self.current_time += self.dt
-        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
-
-<<<<<<< HEAD
-    def timestep_gpu_branchless_grid(self, sync_gpu: bool = False):
-        """
-        GPU timestep with branchless grid-based optimization for A100
-        Combines O(N) grid spatial partitioning with branchless warp-friendly code
-        
-        Args:
-            sync_gpu: If True, wait for GPU to complete (for accurate timing)
-=======
-    def timestep_gpu_shared_memory(self, sync_gpu: bool = False):
-        """
-        GPU timestep with shared memory optimization for A100 memory bandwidth
-        Reduces global memory reads by 64x using cooperative loading
->>>>>>> 51c5a91421fa77253b4ddbd46e6c9df66d2cbe64
-        """
-        # Update parameters buffer with current time
-        self._update_params_buffer()
-        
-        # Bind buffers
-        self.agents_input_buffer.bind_to_storage_buffer(0)   # Input agents
-        self.params_buffer.bind_to_storage_buffer(2)         # Parameters
-        self.agents_output_buffer.bind_to_storage_buffer(5)  # Output agents
-        
-<<<<<<< HEAD
-        # Execute branchless grid simulation shader
-        num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
-        self.branchless_grid_shader.run(num_work_groups, 1, 1)
-        
-        # Force GPU synchronization ONLY if requested
-        if sync_gpu:
-            self.ctx.finish()
-        
-        # Memory barrier
-        self.ctx.memory_barrier()
-        
-        # Update CPU time tracker and swap buffers
-        self.current_time += self.dt
-        self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
-
     def timestep_gpu_two_pass_grid(self, sync_gpu: bool = False):
         """
         True O(N) grid-based timestep using two-pass approach:
@@ -497,11 +266,6 @@ class SimplifiedSimulation:
         # Run agent simulation shader
         num_work_groups = (self.num_agents + self.compute_size_x - 1) // self.compute_size_x
         self.sim_grid_optimized_shader.run(num_work_groups, 1, 1)
-=======
-        # Execute shared memory shader (uses fixed 64-thread workgroups)
-        num_work_groups = (self.num_agents + 64 - 1) // 64
-        self.shared_memory_shader.run(num_work_groups, 1, 1)
->>>>>>> 51c5a91421fa77253b4ddbd46e6c9df66d2cbe64
         
         # Force GPU synchronization ONLY if requested
         if sync_gpu:
@@ -514,13 +278,6 @@ class SimplifiedSimulation:
         self.current_time += self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
 
-    def timestep(self):
-        """Legacy timestep method with CPU synchronization (for debugging)"""
-        self.timestep_gpu_only()
-        
-        # Read back agent data for debugging (slow af)
-        result = self.agents_input_buffer.read()
-        self._update_agents_from_buffer(result)
     
     def _update_agents_from_buffer(self, buffer_data: bytes):
         """Update agent objects from GPU buffer data"""
