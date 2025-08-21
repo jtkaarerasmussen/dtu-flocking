@@ -1,0 +1,98 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+struct Agent{
+    vec2 c;
+    vec2 v;
+    float w_g;
+    float w_s;
+    float theta;
+    float grad_travel;
+};
+
+// Simple grid cell - contains up to MAX_AGENTS_PER_CELL agent indices
+// This avoids complex sorting and gives predictable memory layout
+struct GridCell {
+    uint agent_count;           // Number of agents in this cell
+    uint padding[3];           // Align to 16 bytes
+    uint agent_indices[64];    // Fixed-size array of agent indices (up to 64 agents per cell)
+};
+
+// Input agents
+layout(std430, binding = 0) readonly buffer agents_in {
+    Agent agents[];
+} In;
+
+// Simulation parameters
+layout(std430, binding = 2) readonly buffer parm_in {
+    float r_a;
+    float r_s;
+    float s;
+    float l;
+    float t;
+    float sigma_g;
+    float sigma_r;
+    float theta_max;
+    float dt;
+    float world_size;
+    float tp;
+    uint grid_size;
+    float cell_size;
+} Par;
+
+// Output: Grid structure (each cell contains agent indices)
+layout(std430, binding = 3) coherent buffer grid_out {
+    GridCell cells[];
+} Grid;
+
+// Get grid cell coordinates from world position
+ivec2 get_grid_coords(vec2 pos, float world_size, uint grid_size) {
+    vec2 normalized = mod(pos / world_size, 1.0);
+    ivec2 coords = ivec2(floor(normalized * float(grid_size)));
+    coords = clamp(coords, ivec2(0), ivec2(int(grid_size) - 1));
+    return coords;
+}
+
+// Convert 2D grid coordinates to linear cell index
+uint grid_coords_to_index(ivec2 coords, uint grid_size) {
+    return uint(coords.y * int(grid_size) + coords.x);
+}
+
+void main() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = In.agents.length();
+    uint total_cells = Par.grid_size * Par.grid_size;
+    
+    // First pass: Clear all grid cells
+    if (agent_id < total_cells) {
+        Grid.cells[agent_id].agent_count = 0u;
+        // No need to clear agent_indices array - count acts as bounds
+    }
+    
+    // Barrier to ensure all cells are cleared
+    memoryBarrierBuffer();
+    barrier();
+    
+    // Second pass: Add agents to their respective grid cells
+    if (agent_id < num_agents) {
+        // Get agent position and calculate grid cell
+        vec2 agent_pos = In.agents[agent_id].c;
+        ivec2 grid_coords = get_grid_coords(agent_pos, Par.world_size, Par.grid_size);
+        uint cell_index = grid_coords_to_index(grid_coords, Par.grid_size);
+        
+        // Atomically add this agent to the cell's agent list
+        if (cell_index < total_cells) {
+            uint slot = atomicAdd(Grid.cells[cell_index].agent_count, 1u);
+            
+            // Only add if we have space in the fixed-size array
+            if (slot < 64u) {
+                Grid.cells[cell_index].agent_indices[slot] = agent_id;
+            } else {
+                // If cell is full, decrement the count back
+                // This prevents buffer overflow but may skip some agents
+                atomicAdd(Grid.cells[cell_index].agent_count, uint(-1));
+            }
+        }
+    }
+}
