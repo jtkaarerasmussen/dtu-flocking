@@ -91,8 +91,8 @@ def create_leader_follower_animation(num_agents=100, num_leaders=8, timesteps=15
     start_time = time.time()
     
     for step in range(timesteps):
-        # Use grid-based O(N) timestep instead of O(N²)
-        sim.timestep_gpu_grid()
+        # Use two-pass grid-based O(N) timestep for optimal performance
+        sim.timestep_gpu_two_pass_grid()
         
         # Save data for animation
         if step % save_interval == 0:
@@ -131,7 +131,7 @@ def create_leader_follower_animation(num_agents=100, num_leaders=8, timesteps=15
         ax.set_xlim(0, world_size)
         ax.set_ylim(0, world_size)
         ax.set_aspect('equal')
-        ax.set_title(f'Leader-Follower Dynamics (Grid-based O(N)) - Frame {frame}\n{num_leaders} Leaders (red stars) + {num_agents-num_leaders} Followers (blue dots)', 
+        ax.set_title(f'Leader-Follower Dynamics (Two-Pass Grid O(N)) - Frame {frame}\n{num_leaders} Leaders (red stars) + {num_agents-num_leaders} Followers (blue dots)', 
                     fontsize=12, pad=15)
         ax.legend(loc='upper right', fontsize=10)
         ax.grid(True, alpha=0.3)
