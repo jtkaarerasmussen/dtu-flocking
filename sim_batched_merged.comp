@@ -1,0 +1,326 @@
+#version 430
+
+layout(local_size_x = COMPUTE_SIZE_X, local_size_y = COMPUTE_SIZE_Y) in;
+
+struct Agent{
+    vec2 c;
+    vec2 v;
+    float w_g;
+    float w_s;
+    float theta;
+    float grad_travel;
+};
+
+// Grid cell structure
+struct GridCell {
+    uint agent_count;           // Number of agents in this cell
+    uint padding[3];           // Align to 16 bytes
+    uint agent_indices[64];    // Fixed-size array of agent indices
+};
+
+// Input/Output agents (ping-pong between timesteps)
+layout(std430, binding = 0) coherent buffer agents_buffer {
+    Agent agents[];
+} Agents;
+
+// Batch parameters
+layout(std430, binding = 1) readonly buffer batch_params {
+    int num_timesteps;
+    float start_time;
+} Batch;
+
+// Simulation parameters
+layout(std430, binding = 2) readonly buffer parm_in {
+    float r_a;
+    float r_s;
+    float s;
+    float l;
+    float t;
+    float sigma_g;
+    float sigma_r;
+    float theta_max;
+    float dt;
+    float world_size;
+    float tp;
+    uint grid_size;
+    float cell_size;
+} Par;
+
+// Grid structure (rebuilt each timestep)
+layout(std430, binding = 3) coherent buffer grid_buffer {
+    GridCell cells[];
+} Grid;
+
+// Calculate wrapped distance for periodic boundaries
+vec2 calc_wrapped_diff(vec2 pos1, vec2 pos2, float world_size) {
+    vec2 diff = pos2 - pos1;
+    diff = diff - world_size * floor(diff / world_size + 0.5);
+    return diff;
+}
+
+// Get grid cell coordinates from world position
+ivec2 get_grid_coords(vec2 pos, float world_size, uint grid_size) {
+    vec2 normalized = mod(pos / world_size, 1.0);
+    ivec2 coords = ivec2(floor(normalized * float(grid_size)));
+    coords = clamp(coords, ivec2(0), ivec2(int(grid_size) - 1));
+    return coords;
+}
+
+// Convert 2D grid coordinates to linear cell index
+uint grid_coords_to_index(ivec2 coords, uint grid_size) {
+    return uint(coords.y * int(grid_size) + coords.x);
+}
+
+// Get valid grid cell index with periodic wrapping
+uint get_wrapped_cell_index(ivec2 base_coords, int dx, int dy, uint grid_size) {
+    int g_size = int(grid_size);
+    ivec2 neighbor_coords = base_coords + ivec2(dx, dy);
+    
+    // Handle periodic wrapping
+    neighbor_coords.x = (neighbor_coords.x + g_size) % g_size;
+    neighbor_coords.y = (neighbor_coords.y + g_size) % g_size;
+    
+    return grid_coords_to_index(neighbor_coords, grid_size);
+}
+
+// Hash function for random number generation
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+float random(uint seed) {
+    uint hashed = hash(seed);
+    return float(hashed) / 4294967295.0;
+}
+
+// Build grid from current agent positions
+void build_grid() {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = Agents.agents.length();
+    uint total_cells = Par.grid_size * Par.grid_size;
+    
+    // Clear grid cells
+    if (agent_id < total_cells) {
+        Grid.cells[agent_id].agent_count = 0u;
+    }
+    
+    // Barrier to ensure all cells are cleared
+    memoryBarrierBuffer();
+    barrier();
+    
+    // Add agents to grid cells
+    if (agent_id < num_agents) {
+        vec2 agent_pos = Agents.agents[agent_id].c;
+        ivec2 grid_coords = get_grid_coords(agent_pos, Par.world_size, Par.grid_size);
+        uint cell_index = grid_coords_to_index(grid_coords, Par.grid_size);
+        
+        if (cell_index < total_cells) {
+            uint slot = atomicAdd(Grid.cells[cell_index].agent_count, 1u);
+            
+            if (slot < 64u) {
+                Grid.cells[cell_index].agent_indices[slot] = agent_id;
+            } else {
+                atomicAdd(Grid.cells[cell_index].agent_count, uint(-1));
+            }
+        }
+    }
+    
+    // Ensure grid is built before simulation
+    memoryBarrierBuffer();
+    barrier();
+}
+
+// Simulate one timestep using current grid
+void simulate_timestep(float current_time) {
+    uint agent_id = gl_GlobalInvocationID.x;
+    uint num_agents = Agents.agents.length();
+    
+    if (agent_id >= num_agents) return;
+    
+    // EXACTLY MATCH ORIGINAL: read-only current agent, working copy new agent
+    Agent current_agent = Agents.agents[agent_id];
+    vec2 agent_pos = current_agent.c;
+    Agent new_agent = current_agent;
+    
+    // Get agent's grid cell
+    ivec2 my_coords = get_grid_coords(agent_pos, Par.world_size, Par.grid_size);
+    
+    // Social interaction vectors (exact match to original)
+    vec2 avoidance_direction = vec2(0.0, 0.0);
+    vec2 social_attraction = vec2(0.0, 0.0);
+    vec2 social_alignment = vec2(0.0, 0.0);
+    bool has_avoidance = false;
+    int social_neighbors = 0;
+    
+    // Search 3x3 neighborhood of grid cells
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            uint cell_idx = get_wrapped_cell_index(my_coords, dx, dy, Par.grid_size);
+            uint cell_agent_count = Grid.cells[cell_idx].agent_count;
+            
+            // Process all agents in this cell
+            for (uint i = 0u; i < min(cell_agent_count, 64u); i++) {
+                uint neighbor_id = Grid.cells[cell_idx].agent_indices[i];
+                if (neighbor_id == agent_id) continue;
+                
+                vec2 neighbor_pos = Agents.agents[neighbor_id].c;
+                vec2 r_vec = calc_wrapped_diff(agent_pos, neighbor_pos, Par.world_size);
+                float r = length(r_vec);
+                
+                if (r < Par.r_a && r > 0.001) {
+                    // Zone of avoidance - Paper Eq 1: -Σ (cj - ci) / |cj - ci|
+                    has_avoidance = true;
+                    avoidance_direction += -r_vec / r;
+                } else if (r < Par.r_s && r > 0.001) {
+                    // Zone of socialization - Paper Eq 2 has TWO separate components
+                    social_neighbors++;
+                    
+                    // SOCIAL ATTRACTION: Paper Eq 2: Σ (cj - ci) / |cj - ci|
+                    social_attraction += r_vec / r;
+                    
+                    // SOCIAL ALIGNMENT: Paper Eq 2: Σ vj / |vj|
+                    vec2 neighbor_vel = Agents.agents[neighbor_id].v;
+                    if (length(neighbor_vel) > 0.001) {
+                        social_alignment += normalize(neighbor_vel);
+                    }
+                }
+            }
+        }
+    }
+    
+    // No weighting needed here - done in desired direction calculation
+    
+    // ========== COMPUTE DESIRED DIRECTION (EXACT MATCH TO ORIGINAL) ==========
+    vec2 desired_direction = vec2(0.0, 0.0);
+    
+    if (has_avoidance) {
+        // AVOIDANCE has highest priority
+        if (length(avoidance_direction) > 0.0) {
+            desired_direction = normalize(avoidance_direction);
+        } else {
+            desired_direction = vec2(1.0, 0.0); // Default direction
+        }
+    } else {
+        // Combine social and gradient forces
+        
+        // SOCIAL DIRECTION: Paper Eq 2: dsi = attraction + alignment  
+        vec2 social_direction = social_attraction + social_alignment;
+        
+        // GRADIENT DIRECTION: Paper's discrete-time stochastic process (Eq. line 50)
+        // θ(t + Δt) = θ(t)e^(-ωg*Δt) + √(σg²/(2ωg) * (1 - e^(-2ωg*Δt))) * ζt
+        // where θ is angular deviation from migratory direction (+x axis)
+        vec2 gradient_direction = vec2(0.0, 0.0);
+        float w_g = new_agent.w_g;
+        if (w_g > 0.001) {
+            // Ornstein-Uhlenbeck process parameters
+            float decay_factor = exp(-w_g * Par.dt);
+            float noise_variance = Par.sigma_g * Par.sigma_g * (1.0 - exp(-2.0 * w_g * Par.dt)) / (2.0 * w_g);
+            float noise_scale = sqrt(noise_variance);
+            
+            // Generate Gaussian white noise using Box-Muller transform
+            // Use different seeds to ensure independent random numbers each timestep
+            uint time_seed = uint(current_time / Par.dt);  // Discrete timestep counter
+            float u1 = random(agent_id * 1000u + time_seed * 73u + 123u);
+            float u2 = random(agent_id * 1000u + time_seed * 97u + 456u);
+            
+            // Ensure u1 is not zero to avoid log(0)
+            u1 = max(u1, 1e-8);
+            
+            // Box-Muller transform for Gaussian noise
+            float zeta = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
+            
+            // Update theta according to the Ornstein-Uhlenbeck process
+            float theta = current_agent.theta * decay_factor + noise_scale * zeta;
+            
+            // Wrap theta to [-π, π] to avoid numerical issues
+            theta = mod(theta + 3.14159265359, 2.0 * 3.14159265359) - 3.14159265359;
+            
+            // Store updated theta
+            new_agent.theta = theta;
+            
+            // Convert theta to gradient direction vector
+            // θ=0 means perfect +x direction, θ=±π/2 means ±y direction
+            gradient_direction = vec2(cos(theta), sin(theta));
+        } else {
+            // No gradient detection - keep theta as is
+            new_agent.theta = current_agent.theta;
+        }
+        
+        // RANDOM DIRECTION for noise
+        uint time_seed = uint(current_time / Par.dt);  // Same time seed as gradient calculation
+        float rand_x = (random(agent_id * 13u + time_seed * 37u + 2u) - 0.5) * 2.0;
+        float rand_y = (random(agent_id * 19u + time_seed * 41u + 3u) - 0.5) * 2.0;
+        vec2 random_direction = vec2(rand_x, rand_y);
+        
+        // Paper Eq 3: d'i = (ωsi*dsi + ωgi*dgi + σr*dri) / |ωsi*dsi + ωgi*dgi + σr*dri|
+        desired_direction = new_agent.w_s * social_direction + 
+                           new_agent.w_g * gradient_direction + 
+                           Par.sigma_r * random_direction;
+    }
+    
+    // Normalize desired direction
+    if (length(desired_direction) > 0.0) {
+        desired_direction = normalize(desired_direction);
+    } else {
+        desired_direction = vec2(1.0, 0.0); // Default to x-direction
+    }
+    
+    // ========== APPLY MOVEMENT CONSTRAINTS ==========
+    // Current velocity direction
+    vec2 current_vel_dir = length(current_agent.v) > 0.001 ? 
+                          normalize(current_agent.v) : vec2(1.0, 0.0);
+    
+    // Simple turning rate limit: blend between current and desired direction
+    float turn_rate = Par.theta_max * Par.dt;
+    vec2 new_direction = mix(current_vel_dir, desired_direction, turn_rate);
+    
+    // Set velocity with constant speed
+    new_agent.v = normalize(new_direction) * Par.s;
+    
+    // Update position: ci(t + Δt) = ci(t) + vi(t + Δt) * Δt
+    new_agent.c = current_agent.c + new_agent.v * Par.dt;
+    
+    // Track gradient travel (distance traveled in positive x-direction)
+    float x_component = new_agent.v.x * Par.dt;
+    new_agent.grad_travel = current_agent.grad_travel + x_component;
+    
+    // ========== PERIODIC BOUNDARY CONDITIONS ==========
+    // Handle X-axis periodic boundary
+    if (new_agent.c.x >= Par.world_size) {
+        new_agent.c.x -= Par.world_size;
+    } else if (new_agent.c.x < 0.0) {
+        new_agent.c.x += Par.world_size;
+    }
+    
+    // Handle Y-axis periodic boundary
+    if (new_agent.c.y >= Par.world_size) {
+        new_agent.c.y -= Par.world_size;
+    } else if (new_agent.c.y < 0.0) {
+        new_agent.c.y += Par.world_size;
+    }
+    
+    // Write back to buffer
+    Agents.agents[agent_id] = new_agent;
+}
+
+void main() {
+    // Run multiple timesteps in single kernel launch
+    for (int step = 0; step < Batch.num_timesteps; step++) {
+        float current_time = Batch.start_time + float(step) * Par.dt;
+        
+        // Step 1: Build spatial grid
+        build_grid();
+        
+        // Step 2: Simulate using grid
+        simulate_timestep(current_time);
+        
+        // Sync all threads before next timestep
+        memoryBarrierBuffer();
+        barrier();
+    }
+}

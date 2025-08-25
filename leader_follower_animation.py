@@ -29,19 +29,12 @@ class LeaderFollowerSimulation(SimplifiedSimulation):
             vy = self.sim_params['s'] * np.sin(theta)
             
             # Agent parameters (mostly for testing)
-            if i % 2 == 0:
-                w_g = 0.45  
-                w_s = 0.2  
-            else:
-                w_g = 0
-                w_s = 1.0
-            
             if i < self.num_leaders:
                 w_g = 2.0 
                 w_s = 0.0
             else:
                 w_g = 0.0 
-                w_s = np.random.uniform(0.3,1.0)
+                w_s = np.random.uniform(0.5,1.0)
 
             agents.append(Agent(x, y, vx, vy, w_g, w_s, theta))
         return agents
@@ -90,19 +83,39 @@ def create_leader_follower_animation(num_agents=100, num_leaders=8, timesteps=15
     print("Running simulation...")
     start_time = time.time()
     
-    for step in range(timesteps):
-        # Use two-pass grid-based O(N) timestep for optimal performance
-        sim.timestep()
+    # Use batched timesteps to reduce kernel launch overhead
+    batch_size = 10
+    num_batches = timesteps // batch_size
+    remaining_steps = timesteps % batch_size
+    
+    step_counter = 0
+    
+    for batch in range(num_batches):
+        # Run batch of timesteps in single kernel launch
+        sim.timestep_batched(batch_size)
         
-        # Save data for animation
-        if step % save_interval == 0:
-            leader_pos, follower_pos = sim.get_leader_follower_positions()
-            leader_positions_history.append(leader_pos.copy())
-            follower_positions_history.append(follower_pos.copy())
-        
-        # Progress
-        if step % 150 == 0:
-            print(f"Step {step}/{timesteps}")
+        # Save data for animation from each timestep in batch
+        for sub_step in range(batch_size):
+            if step_counter % save_interval == 0:
+                leader_pos, follower_pos = sim.get_leader_follower_positions()
+                leader_positions_history.append(leader_pos.copy())
+                follower_positions_history.append(follower_pos.copy())
+            
+            step_counter += 1
+            
+            # Progress
+            if step_counter % 150 == 0:
+                print(f"Step {step_counter}/{timesteps}")
+    
+    # Handle remaining steps
+    if remaining_steps > 0:
+        sim.timestep_batched(remaining_steps)
+        for sub_step in range(remaining_steps):
+            if step_counter % save_interval == 0:
+                leader_pos, follower_pos = sim.get_leader_follower_positions()
+                leader_positions_history.append(leader_pos.copy())
+                follower_positions_history.append(follower_pos.copy())
+            step_counter += 1
     
     runtime = time.time() - start_time
     print(f"Simulation completed in {runtime:.2f}s ({timesteps/runtime:.0f} steps/sec)")

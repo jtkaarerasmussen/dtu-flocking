@@ -86,6 +86,10 @@ class SimplifiedSimulation:
         
         # Load grid-based shaders for O(N) complexity
         self._load_grid_shaders()
+        
+        # Load batched merged shader for reduced kernel launches
+        self._load_batched_merged_shader()
+        
         self._setup_grid_system()
         
         # Initialize agents and buffers (after grid setup)
@@ -138,6 +142,16 @@ class SimplifiedSimulation:
         shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
         shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
         self.sim_grid_optimized_shader = self.ctx.compute_shader(shader_source)
+    
+    def _load_batched_merged_shader(self):
+        """Load and compile the batched merged compute shader"""
+        with open('sim_batched_merged.comp', 'r') as f:
+            shader_source = f.read()
+        
+        shader_source = shader_source.replace('COMPUTE_SIZE_X', str(self.compute_size_x))
+        shader_source = shader_source.replace('COMPUTE_SIZE_Y', '1')
+        
+        self.batched_merged_shader = self.ctx.compute_shader(shader_source)
     
     def _setup_grid_system(self):
         """Setup grid system for spatial partitioning"""
@@ -279,6 +293,43 @@ class SimplifiedSimulation:
         # Update CPU time tracker and swap buffers
         self.current_time += self.dt
         self.agents_input_buffer, self.agents_output_buffer = self.agents_output_buffer, self.agents_input_buffer
+
+    def timestep_batched(self, num_timesteps: int = 10, sync_gpu: bool = False):
+        """
+        Run multiple timesteps in a single kernel launch to reduce overhead.
+        Combines grid building and simulation into one shader.
+        
+        Args:
+            num_timesteps: Number of timesteps to run in single launch
+            sync_gpu: If True, wait for GPU to complete (for accurate timing)
+        """
+        # Update batch parameters
+        batch_data = struct.pack('if', num_timesteps, self.current_time)
+        self.batch_params_buffer.write(batch_data)
+        
+        # Update simulation parameters for current time
+        self._update_params_buffer()
+        
+        # Bind all required buffers
+        self.agents_input_buffer.bind_to_storage_buffer(0)   # Agent data (read-write)
+        self.batch_params_buffer.bind_to_storage_buffer(1)   # Batch parameters
+        self.params_buffer.bind_to_storage_buffer(2)         # Simulation parameters
+        self.grid_buffer.bind_to_storage_buffer(3)           # Grid buffer
+        
+        # Single kernel launch for all timesteps
+        max_work_items = max(self.num_agents, self.total_grid_cells)
+        num_work_groups = (max_work_items + self.compute_size_x - 1) // self.compute_size_x
+        self.batched_merged_shader.run(num_work_groups, 1, 1)
+        
+        # Force GPU synchronization if requested
+        if sync_gpu:
+            self.ctx.finish()
+        
+        # Memory barrier
+        self.ctx.memory_barrier()
+        
+        # Update CPU time tracker (all timesteps completed)
+        self.current_time += num_timesteps * self.dt
 
     
     def _update_agents_from_buffer(self, buffer_data: bytes):

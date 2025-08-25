@@ -168,6 +168,7 @@ class CheckpointEvolutionSimulation:
         """Fast fitness evaluation with GPU memory pool"""
         fitness_sum = np.zeros(self.num_agents, dtype=np.float32)
         
+        # Create simulation instance once, reuse with proper time reset
         if not hasattr(self, '_sim'):
             self._sim = SimplifiedSimulation(
                 world_size=self.world_size,
@@ -186,18 +187,19 @@ class CheckpointEvolutionSimulation:
         sim = self._sim
         
         for run in range(self.nr):
+            # Reset time state for consistent random seeds
+            sim.current_time = 0.0
+            
             self._reset_simulation_state(sim, population)
             
-            # Run transient period using grid-based timesteps
-            for _ in range(self.tau_tr):
-                sim.timestep()
+            # Run transient period using large batched timesteps (minimize kernel launches)
+            sim.timestep_batched(self.tau_tr)
             
             # Reset gradient travel for fitness evaluation
             self._reset_gradient_travel(sim)
             
-            # Run fitness evaluation period using grid-based timesteps
-            for _ in range(self.tau_fit):
-                sim.timestep()
+            # Run fitness evaluation period using large batched timesteps
+            sim.timestep_batched(self.tau_fit)
             
             # Calculate fitness on GPU
             run_fitness = sim.calculate_fitness_gpu(
