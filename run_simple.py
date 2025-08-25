@@ -56,7 +56,9 @@ class SimplifiedSimulation:
             self.ctx = moderngl.create_context(standalone=True, backend='egl')
         except Exception:
             self.ctx = moderngl.create_context(standalone=True)
-        
+
+        print(f"OpenGL Renderer: {self.ctx.info['GL_RENDERER']}")
+        print(f"OpenGL Version: {self.ctx.info['GL_VERSION']}")
         # Initialize simulation parameters
         self.sim_params = {
             'r_a': r_a,
