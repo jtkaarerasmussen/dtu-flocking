@@ -28,7 +28,7 @@ class SimplifiedSimulation:
     def __init__(self, world_size: float, num_agents: int, 
                  r_a: float = 0.05, r_s: float = 0.3, s: float = 0.1, 
                  sigma_g: float = 0.1, sigma_r: float = 0.1, theta_max: float = 2.0, 
-                 dt: float = 0.01, tp: float = 100.0, compute_size_x: int = 256):
+                 dt: float = 0.01, tp: float = 100.0, compute_size_x: int = 256, silence=True):
         """
         Simplified simulation without grid system
         
@@ -57,8 +57,10 @@ class SimplifiedSimulation:
         except Exception:
             self.ctx = moderngl.create_context(standalone=True)
 
-        print(f"OpenGL Renderer: {self.ctx.info['GL_RENDERER']}")
-        print(f"OpenGL Version: {self.ctx.info['GL_VERSION']}")
+        if not silence:
+            print(f"OpenGL Renderer: {self.ctx.info['GL_RENDERER']}")
+            print(f"OpenGL Version: {self.ctx.info['GL_VERSION']}")
+
         # Initialize simulation parameters
         self.sim_params = {
             'r_a': r_a,
@@ -162,7 +164,7 @@ class SimplifiedSimulation:
         self.grid_size = max(8, int(np.ceil(self.world_size / self.grid_cell_size)))
         self.total_grid_cells = self.grid_size * self.grid_size
         
-        print(f"Grid system: {self.grid_size}x{self.grid_size} cells, cell_size={self.grid_cell_size:.4f}")
+        # print(f"Grid system: {self.grid_size}x{self.grid_size} cells, cell_size={self.grid_cell_size:.4f}")
         
         # Create grid-related buffers
         # Grid cells buffer (start_index, count, padding, padding)
@@ -493,18 +495,17 @@ def generate_random_agents(num_agents: int, world_size: float, seed: int = 42) -
 
 if __name__ == "__main__":
     # Performance comparison test
-    print("=== SIMPLIFIED SIMULATION PERFORMANCE TEST ===")
+    print("=== SIMULATION PERFORMANCE TEST ===")
     
     WORLD_SIZE = 2.0
     NUM_AGENTS = 16384  
-    NUM_TIMESTEPS = 1000
-    DENSITY = 0.01
+    NUM_TIMESTEPS = 2500
+    DENSITY = 0.0277
+    BATCH_SIZE=10
     
     # Calculate r_a from density: ra = l*sqrt(ρ/N)
     R_A = WORLD_SIZE * math.sqrt(DENSITY / NUM_AGENTS)
     
-    print(f"Testing with {NUM_AGENTS} agents for {NUM_TIMESTEPS} timesteps")
-    print(f"Zone parameters: r_a = {R_A:.4f}, r_s = {6.0 * R_A:.4f}")
     
     # Initialize simulation
     start_time = time.time()
@@ -527,15 +528,13 @@ if __name__ == "__main__":
     # Performance test 
     print(f"\nRunning {NUM_TIMESTEPS} GPU-only timesteps...")
     start_time = time.time()
+
     
-    for i in range(NUM_TIMESTEPS):
-        sim.timestep_gpu_only()
-        
-        if (i + 1) % 100 == 0:
-            elapsed = time.time() - start_time
-            steps_per_sec = (i + 1) / elapsed
-            print(f"Step {i+1:4d}: {steps_per_sec:.1f} timesteps/sec")
-    
+
+    for i in range(NUM_TIMESTEPS // BATCH_SIZE):
+        sim.timestep_batched(BATCH_SIZE)
+    sim.ctx.finish() 
+
     total_time = time.time() - start_time
     final_steps_per_sec = NUM_TIMESTEPS / total_time
     
@@ -543,6 +542,8 @@ if __name__ == "__main__":
     print(f"Total time: {total_time:.3f} seconds")
     print(f"Average: {final_steps_per_sec:.1f} timesteps/sec")
     print(f"Agent-timesteps/sec: {NUM_AGENTS * final_steps_per_sec:.0f}")
+
+    
     
     
     sim.cleanup()

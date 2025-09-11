@@ -8,6 +8,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from run_simple import SimplifiedSimulation
+from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans 
 
 class CheckpointEvolutionSimulation:
     """
@@ -17,7 +19,7 @@ class CheckpointEvolutionSimulation:
     def __init__(self, world_size=2.0, num_agents=640, density=2.77e-2,
                  pg=1.0, ps=0.0, omega_gc=4.0, omega_sc=4.0,
                  sigma_mu=0.01, tau_tr=50, tau_fit=25, nr=2,
-                 checkpoint_interval=10, checkpoint_dir=None):
+                 checkpoint_interval=10, checkpoint_dir=None, selection_method='tournament', leader_kill_prob = 0.0):
         """
         Initialize evolutionary simulation with checkpointing
         
@@ -42,6 +44,8 @@ class CheckpointEvolutionSimulation:
         self.tau_tr = tau_tr
         self.tau_fit = tau_fit
         self.nr = nr
+        self.selection_method = selection_method
+        self.leader_kill_prob = leader_kill_prob
         
         # Checkpointing parameters
         self.checkpoint_interval = checkpoint_interval
@@ -88,7 +92,8 @@ class CheckpointEvolutionSimulation:
             'tau_tr': self.tau_tr,
             'tau_fit': self.tau_fit,
             'nr': self.nr,
-            'checkpoint_interval': self.checkpoint_interval
+            'checkpoint_interval': self.checkpoint_interval,
+            'selection_method': self.selection_method
         }
     
     def save_parameters(self):
@@ -102,12 +107,27 @@ class CheckpointEvolutionSimulation:
         """Initialize population with random traits"""
         population = []
         for i in range(self.num_agents):
-            individual = {
-                'w_g': np.random.rand() * 2,
-                'w_s': np.random.rand() * 2,
-                'fitness': 0.0,
-                'id': i
-            }
+            # start close to eq
+            if i % 4 ==0:
+                individual = {
+                    'w_g': max(0.0, np.random.normal(0.3,0.5)),
+                    'w_s': 0.0,
+                    'fitness': 0.0,
+                    'id': i
+                }
+            else:
+                individual = {
+                    'w_g': 0.0,
+                    'w_s': max(0.0, np.random.normal(0.3,0.5)),
+                    'fitness': 0.0,
+                    'id': i
+                }
+            # individual = {
+            #     'w_g': np.random.rand() * 2,
+            #     'w_s': np.random.rand() * 2,
+            #     'fitness': 0.0,
+            #     'id': i
+            # }
             population.append(individual)
         return population
     
@@ -213,17 +233,71 @@ class CheckpointEvolutionSimulation:
         return fitness_sum / self.nr
     
     def _reset_simulation_state(self, sim, population):
-        """GPU-only reset - ELIMINATES MAJOR A100 BOTTLENECK!"""
-        # Reset agents entirely on GPU (no CPU-GPU transfers!)
+        # Reset agents entirely on GPU 
         sim.reset_agents_gpu(population, self.world_size, self.r_a)
         sim.current_time = 0.0
     
     def _reset_gradient_travel(self, sim):
-        """GPU-only gradient travel reset (no CPU transfers)"""
+        """GPU-only gradient travel reset """
         sim.reset_gradient_travel_gpu()
+
+    def adjust_fitness_with_bimodal_detection(self, population, fitness_values):
+        fittable = np.array([[p["w_g"]] for p in population])
+        gm = GaussianMixture(n_components=2).fit(fittable)
+        gm1 = GaussianMixture(n_components=1).fit(fittable)
+        if gm.score(fittable) / gm1.score(fittable) < 2: # Test if population bifurcated on w_g axs
+            return np.array([-np.inf if np.random.rand() < self.leader_kill_prob else f for f in fitness_values])
+
+        leader_index = np.argmax(gm.means_)
+        out_fit = np.zeros_like(fitness_values)
+        for i,p in enumerate(population):
+            p_loc = [[p["w_g"]]]
+            if gm.predict(p_loc) == leader_index and np.random.rand() <= self.leader_kill_prob:
+                out_fit[i] = -np.inf
+            else:
+                out_fit[i] = fitness_values[i]
+        return out_fit
+
+    def adjust_fitness_roulette(self, population, fitness_values):
+        w_g_list = np.array([p["w_g"] for p in population])
+        total_w_g = np.sum(w_g_list)
+        probabilities = w_g_list / total_w_g
+        
+        new_fitness = np.copy(fitness_values)
+        for i in range(self.num_agents):
+            if np.random.rand() >= self.leader_kill_prob:
+                continue
+            kill_idx = np.random.choice(len(population), p=probabilities)
+            new_fitness[kill_idx] = -np.inf
+        
+        return new_fitness
+
     
+    def tournament_selection(self, population, fitness_values, tournament_size=5):
+        """Tournament selection preserves fitness differences"""
+        new_population = []
+        for i in range(self.num_agents):
+            # Select random individuals for tournament
+            tournament_indices = np.random.choice(len(population), size=tournament_size, replace=False)
+            tournament_fitness = fitness_values[tournament_indices]
+            
+            # Winner is individual with highest fitness
+            winner_idx = tournament_indices[np.argmax(tournament_fitness)]
+            parent = population[winner_idx]
+            
+            offspring = {
+                'w_g': parent['w_g'],
+                'w_s': parent['w_s'],
+                'fitness': 0.0,
+                'id': i,
+                'parent_id': parent['id']
+            }
+            new_population.append(offspring)
+        
+        return new_population
+
     def roulette_wheel_selection(self, population, fitness_values):
-        """Fitness-proportional selection using softmax"""
+        """Fitness-proportional selection with fitness shifting (original method)"""
         min_fitness = np.min(fitness_values)
         if min_fitness < 0:
             adjusted_fitness = fitness_values - min_fitness
@@ -249,7 +323,44 @@ class CheckpointEvolutionSimulation:
             new_population.append(offspring)
         
         return new_population
-    
+
+    def rank_selection(self, population, fitness_values):
+        """Rank-based selection preserves fitness ordering"""
+        # Convert fitness to ranks (1 = worst, n = best)
+        ranks = np.argsort(np.argsort(fitness_values)) + 1
+        
+        # Linear ranking: probability proportional to rank
+        probabilities = ranks / np.sum(ranks)
+        
+        new_population = []
+        for i in range(self.num_agents):
+            parent_idx = np.random.choice(len(population), p=probabilities)
+            parent = population[parent_idx]
+            
+            offspring = {
+                'w_g': parent['w_g'], 
+                'w_s': parent['w_s'],
+                'fitness': 0.0,
+                'id': i,
+                'parent_id': parent['id']
+            }
+            new_population.append(offspring)
+        
+        return new_population
+
+    def select_population(self, population, fitness_values):
+        """Dispatch to appropriate selection method and preform leader killing when it is turned on"""
+        if self.leader_kill_prob != 0.0:
+            fitness_values = self.adjust_fitness_roulette(population, fitness_values)
+        if self.selection_method == 'tournament':
+            return self.tournament_selection(population, fitness_values)
+        elif self.selection_method == 'roulette':
+            return self.roulette_wheel_selection(population, fitness_values)
+        elif self.selection_method == 'rank':
+            return self.rank_selection(population, fitness_values)
+        else:
+            raise ValueError(f"Unknown selection method: {self.selection_method}")
+
     def mutate_population(self, population):
         """Apply Gaussian mutations"""
         for individual in population:
@@ -349,7 +460,7 @@ class CheckpointEvolutionSimulation:
             # Evolution (skip on final generation)
             if gen_offset < num_generations - 1:
                 # Selection
-                new_population = self.roulette_wheel_selection(self.population, fitness_values)
+                new_population = self.select_population(self.population, fitness_values)
                 
                 # Mutation
                 new_population = self.mutate_population(new_population)
@@ -426,7 +537,7 @@ def run_evolution_from_params(params_dict_or_file, num_generations=None, start_f
     # Keep only necessary parameters for constructor
     necessary_params = {
         'world_size', 'num_agents', 'density', 'pg', 'ps', 'omega_gc', 'omega_sc',
-        'sigma_mu', 'tau_tr', 'tau_fit', 'nr', 'checkpoint_interval', 'checkpoint_dir'
+        'sigma_mu', 'tau_tr', 'tau_fit', 'nr', 'checkpoint_interval', 'checkpoint_dir', 'selection_method', "leader_kill_prob"
     }
     simulation_params = {k: v for k, v in params.items() if k in necessary_params}
     
@@ -454,7 +565,9 @@ def create_default_params_file(filename="evolution_params.json"):
         "tau_fit": 500,
         "nr": 30,
         "checkpoint_interval": 10,
-        "num_generations": 300
+        "num_generations": 300,
+        "selection_method": "tournament",
+        "leader_kill_prob": 0.0
     }
     
     with open(filename, 'w') as f:
