@@ -93,7 +93,8 @@ class CheckpointEvolutionSimulation:
             'tau_fit': self.tau_fit,
             'nr': self.nr,
             'checkpoint_interval': self.checkpoint_interval,
-            'selection_method': self.selection_method
+            'selection_method': self.selection_method,
+            'leader_kill_prob': self.leader_kill_prob
         }
     
     def save_parameters(self):

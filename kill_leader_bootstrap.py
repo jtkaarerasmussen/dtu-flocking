@@ -26,7 +26,7 @@ def create_default_params_file(filename="evolution_params.json", leader_kill_pro
     print(f"Default parameters saved to {filename}")
     return filename
 
-prob_points = np.linspace(0,1,50)
+prob_points = np.linspace(0,0.2,50)
 
 for i,p in enumerate(prob_points):
     print(i,p)
